@@ -297,6 +297,7 @@ async def test_installed_agent_gets_proxy_environment_and_bridged_servers_only_f
     assert inner.extra_env["ANTHROPIC_API_KEY"] != "untrusted-job-key"
     assert inner.extra_env["ANTHROPIC_BASE_URL"] == "http://localhost:13131"
     assert inner.extra_env["ANTHROPIC_SMALL_FAST_MODEL"] == "claude-test"
+    assert inner.mcp_servers == []
     environment = FakeRelayEnvironment(tmp_path / "trial")
     await wrapper.run(
         "do work",
@@ -306,6 +307,7 @@ async def test_installed_agent_gets_proxy_environment_and_bridged_servers_only_f
     assert environment.attached is FakeTrialRelay.latest
     assert FakeTrialRelay.latest is not None and FakeTrialRelay.latest.opened
     assert FakeTrialRelay.latest.ended
+    assert FakeTrialRelay.latest.agent_key == inner.extra_env["ANTHROPIC_API_KEY"]
     assert [(server.name, server.url) for server in inner.seen_mcp_servers] == [
         ("task-tools", "http://localhost:13131/mcp/task-tools")
     ]
@@ -416,10 +418,11 @@ def test_the_setup_timeout_override_reaches_the_inner_agent(tmp_path: Path) -> N
 def test_a_wrapped_agents_caller_key_is_registered_for_redaction(
     tmp_path: Path,
 ) -> None:
-    _ = _relay_agent(tmp_path, _installed_agent_config())
+    wrapper = _relay_agent(tmp_path, _installed_agent_config())
     assert InstalledAgent.latest is not None
     key = InstalledAgent.latest.extra_env["ANTHROPIC_API_KEY"]
-    assert key != "untrusted-job-key"
+    assert key == wrapper._agent_key
+    assert key not in _Secrets().protected_values()
 
 
 def test_a_wrapped_agent_declares_its_inner_agents_capabilities(tmp_path: Path) -> None:
@@ -483,6 +486,12 @@ async def test_a_timeout_while_the_relay_waits_for_its_proxy_leaves_the_verifier
         await phase
     assert WaitingRelay.latest is not None
     assert WaitingRelay.latest.phase == "verifier"
+    assert InstalledAgent.latest is not None and InstalledAgent.latest.calls == []
+    assert (
+        WaitingRelay.latest.phase_env()["ANTHROPIC_API_KEY"]
+        == WaitingRelay.latest.verifier_key
+    )
+    assert WaitingRelay.latest.agent_key not in WaitingRelay.latest.phase_env().values()
 
 
 async def test_a_runner_loop_resume_keeps_the_host_trajectory(tmp_path: Path) -> None:
@@ -542,6 +551,26 @@ def test_preflight_refuses_an_agent_that_calls_a_model_with_no_llm_proxy(
 ) -> None:
     agent.RelayAgent.preflight({"agent": wrapped, "relay": RELAY}, {})
 
+    class NoApiBaseUpstream:
+        async def resolve(
+            self, *, dialect: RequestDialect, model: str
+        ) -> UpstreamTarget:
+            del dialect, model
+            return UpstreamTarget("https://upstream.test", {})
+
+    with pytest.raises(ValueError, match="api_base"):
+        agent.RelayAgent.preflight(
+            {
+                "agent": {
+                    "import_path": f"{__name__}:LoopAgent",
+                    "model_name": "anthropic/claude-test",
+                },
+                "relay": RELAY,
+                "upstream": NoApiBaseUpstream(),
+            },
+            {},
+        )
+
 
 def test_preflight_refuses_a_runner_loop_agent_hawk_cannot_route() -> None:
     class NoApiBaseUpstream:
@@ -556,6 +585,18 @@ def test_preflight_refuses_a_runner_loop_agent_hawk_cannot_route() -> None:
     )
     with pytest.raises(ValueError, match="api_base"):
         _ = agent.runner_loop_api_base(LoopAgent, config, NoApiBaseUpstream())
+    with pytest.raises(ValueError, match="api_base"):
+        agent.RelayAgent.preflight(
+            {
+                "agent": {
+                    "import_path": f"{__name__}:LoopAgent",
+                    "model_name": "claude-test",
+                },
+                "relay": RELAY,
+                "upstream": NoApiBaseUpstream(),
+            },
+            {},
+        )
 
 
 @pytest.mark.parametrize(
@@ -605,6 +646,7 @@ async def test_a_failed_runner_loop_phase_keeps_its_trajectory(tmp_path: Path) -
     saved = tmp_path / "sandbox-agent-proxy" / "trajectory.json"
     assert saved.read_text(encoding="utf-8") == "partial trajectory"
     assert agent.RUNNER_LOOP_OUTCOMES["trial"].runner_atif == saved
+    assert agent.RUNNER_LOOP_OUTCOMES["trial"].runner_atif_sha256 is not None
 
 
 @pytest.mark.parametrize(

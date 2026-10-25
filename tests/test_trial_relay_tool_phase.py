@@ -47,7 +47,9 @@ async def test_a_claude_code_trials_granted_call_is_refused_outside_the_agents_t
     ran: list[str] = []
     guarded = _guard(lambda: phase, events, ran)
 
-    with pytest.raises(inspect_ai.tool.ToolError, match="relay phase: verifier"):
+    with pytest.raises(
+        inspect_ai.tool.ToolError, match="relay phase: verifier"
+    ) as refused:
         await guarded(text="hello")
 
     assert ran == []
@@ -63,6 +65,11 @@ async def test_a_claude_code_trials_granted_call_is_refused_outside_the_agents_t
             },
         )
     ]
+    assert f"{_SERVER}/{_TOOL}" in refused.value.message
+    assert "relay phase: verifier" in refused.value.message
+    assert len(events) == 1
+    assert events[0].data["server"] == _SERVER
+    assert events[0].data["tool"] == _TOOL
 
 
 async def test_a_codex_trials_bare_call_is_served_in_the_agents_turn_and_refused_after() -> (
@@ -80,6 +87,10 @@ async def test_a_codex_trials_bare_call_is_served_in_the_agents_turn_and_refused
 
     assert ran == ["hello"]
     assert len(events) == 1
+    assert events[0].data["server"] == _SERVER
+    assert events[0].data["tool"] == _TOOL
+    assert events[0].data["reason"] == "outside the agent's turn"
+    assert events[0].phase == "verifier"
 
 
 async def test_a_later_steps_agent_turn_is_served_between_two_refusals() -> None:
@@ -98,6 +109,12 @@ async def test_a_later_steps_agent_turn_is_served_between_two_refusals() -> None
 
     assert ran == ["two"]
     assert [event.phase for event in events] == ["verifier", "verifier"]
+    assert len(events) == 2
+    assert [event.kind for event in events] == [
+        "refused-tool-call",
+        "refused-tool-call",
+    ]
+    assert all(event.data["tool"] == _TOOL for event in events)
 
 
 async def test_the_judges_model_calls_are_answered_while_its_tool_calls_are_refused() -> (
@@ -115,6 +132,9 @@ async def test_the_judges_model_calls_are_answered_while_its_tool_calls_are_refu
     assert ran == []
     assert events[0].kind == "refused-tool-call"
     assert events[0].phase == "verifier"
+    assert events[0].data["server"] == _SERVER
+    assert events[0].data["tool"] == _TOOL
+    assert events[0].data["reason"] == "outside the agent's turn"
 
 
 async def test_the_guard_changes_nothing_the_bridge_serves_for_the_tool() -> None:
@@ -147,3 +167,8 @@ async def test_the_guard_changes_nothing_the_bridge_serves_for_the_tool() -> Non
     )
     assert actual.viewer is expected.viewer
     assert actual.model_input is expected.model_input
+    assert actual.name == expected.name
+    assert actual.description == expected.description
+    assert actual.parameters.model_dump() == expected.parameters.model_dump()
+    assert actual.parallel == expected.parallel
+    assert actual.max_output == expected.max_output

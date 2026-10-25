@@ -251,6 +251,13 @@ async def test_the_tests_tree_is_assembled_root_only_and_moved_in_locked(
         assert upload.stage_mode == 0o700
         assert upload.stage_uid == os.geteuid()
         assert not upload.tests_dir_existed
+    assert len(_inner().uploads) == 1
+    assert _inner().uploads[0].target.name == "tests"
+    assert _inner().uploads[0].target.parent == _inner().uploads[0].stage
+    assert _inner().uploads[0].stage_uid == os.geteuid()
+    assert _inner().uploads[0].stage_mode == 0o700
+    assert _inner().uploads[0].tests_dir_existed is False
+    assert _inner().uploads[0].stage is not None
     assert _tree(tests) == files
     _assert_locked(tests, os.geteuid())
     assert _stages(root) == []
@@ -362,6 +369,7 @@ async def test_a_symbolic_link_at_tests_is_refused_and_never_followed(
     assert _tree(elsewhere) == {"planted.txt": "planted\n"}
     assert _inner().uploads == []
     assert _stages(root) == []
+    assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o755
 
 
 async def test_a_tests_directory_that_appears_while_staging_is_refused_untouched(

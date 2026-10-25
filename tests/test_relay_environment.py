@@ -945,6 +945,11 @@ async def test_the_tests_tree_is_assembled_root_only_and_moved_in_locked(
     assert (
         install.index("chown -R") < install.index("chmod -R") < install.index("mv -T")
     )
+    assert calls[0].args[0] != calls[-1].args[0]
+    assert all(upload.stage_uid == os.geteuid() for upload in inner.uploads)
+    assert all(upload.stage_mode == 0o700 for upload in inner.uploads)
+    assert all(not upload.tests_dir_existed for upload in inner.uploads)
+    assert calls[-1].kwargs["user"] == "root"
 
     assert _tree(tests) == files | (
         {"sandbox-agent-proxy/conversation.json": json.dumps(conversation)}
@@ -1468,6 +1473,7 @@ async def test_a_symbolic_link_at_tests_is_refused_and_never_followed(
     assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o755
     assert _host_inner().uploads == []
     assert _stages(root) == []
+    assert all(call.name != "upload_dir" for call in _host_inner().calls)
 
 
 async def test_a_file_at_tests_is_refused_untouched(

@@ -216,6 +216,7 @@ def test_the_relay_registers_both_caller_keys_for_redaction() -> None:
         relay_instance.agent_key,
         relay_instance.verifier_key,
     } <= relay_instance.protected_values()
+    assert relay_instance.agent_key != relay_instance.verifier_key
 
 
 async def test_close_does_not_swallow_its_own_cancellation(
@@ -262,6 +263,7 @@ async def test_close_returns_the_outcome_whatever_the_proxy_task_raised(
     assert outcome.answered_agent_calls == 1
     assert outcome.proxy_exit is not None
     assert outcome.proxy_exit["error"] == "ConnectionError('the sandbox pod is gone')"
+    assert outcome.mode == "relay"
 
 
 async def test_each_swap_to_the_verifier_mints_a_fresh_key_and_retires_the_last() -> (
@@ -275,6 +277,8 @@ async def test_each_swap_to_the_verifier_mints_a_fresh_key_and_retires_the_last(
 
     second = relay_instance.verifier_key
     assert second != first
+    assert first in relay_instance.protected_values()
+    assert second in relay_instance.protected_values()
     assert relay_instance.phase_env()["ANTHROPIC_API_KEY"] == second
     calls: list[RelayCall] = []
 
@@ -515,6 +519,7 @@ async def test_later_side_call_cannot_vouch_for_a_fabricated_selected_turn(
     await relay_instance.end_agent_phase()
 
     assert relay_instance.verifier_conversation is not None
+    assert "refused" in relay_instance.verifier_conversation
     assert "no response the relay recorded earlier produced" in str(
         relay_instance.verifier_conversation["refused"]
     )
