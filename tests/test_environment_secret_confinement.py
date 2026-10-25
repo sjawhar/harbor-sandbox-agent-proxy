@@ -10,7 +10,10 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
 
-from harbor_sandbox_agent_proxy.environment import RelayEnvironment
+from harbor_sandbox_agent_proxy.environment import (
+    RelayEnvironment,
+    RunnerSecretExposureError,
+)
 
 
 class RecordingEnvironment(BaseEnvironment):
@@ -121,7 +124,7 @@ def _environment(
     )
 
 
-async def test_template_task_env_is_resolved_then_removed_before_inner_construction(
+async def test_template_task_env_is_resolved_then_refused_before_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     host_key = "host-key-not-for-sandbox"
@@ -133,12 +136,13 @@ async def test_template_task_env_is_resolved_then_removed_before_inner_construct
     assert RecordingEnvironment.latest is not None
     assert RecordingEnvironment.latest.received_task_env == {}
 
-    await environment.start(False)
+    with pytest.raises(RunnerSecretExposureError, match="OPENAI_API_KEY") as error:
+        await environment.start(False)
 
-    assert RecordingEnvironment.latest.seen_startup == {}
+    assert host_key not in str(error.value)
 
 
-async def test_persistent_env_is_resolved_then_removed_before_inner_construction(
+async def test_persistent_env_is_resolved_then_refused_before_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     host_key = "host-key-not-for-sandbox"
@@ -151,9 +155,10 @@ async def test_persistent_env_is_resolved_then_removed_before_inner_construction
     assert RecordingEnvironment.latest is not None
     assert RecordingEnvironment.latest.received_persistent_env == {}
 
-    await environment.start(False)
+    with pytest.raises(RunnerSecretExposureError, match="JOB_CONFIG_KEY") as error:
+        await environment.start(False)
 
-    assert RecordingEnvironment.latest.seen_startup == {}
+    assert host_key not in str(error.value)
 
 
 async def test_started_sandbox_with_protected_value_is_stopped_and_refused(
@@ -165,7 +170,7 @@ async def test_started_sandbox_with_protected_value_is_stopped_and_refused(
     environment = _environment(tmp_path)
 
     try:
-        with pytest.raises(RuntimeError, match="UNRELATED_NAME") as error:
+        with pytest.raises(RunnerSecretExposureError, match="UNRELATED_NAME") as error:
             await environment.start(False)
     finally:
         RecordingEnvironment.reported_environment = ""

@@ -10,6 +10,8 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
+import textwrap
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, Literal, override
@@ -24,6 +26,7 @@ from harbor_sandbox_agent_proxy import environment as relay_environment
 from harbor_sandbox_agent_proxy.environment import (
     MANAGED_PROVIDER_VARIABLES,
     RelayEnvironment,
+    RunnerSecretExposureError,
     SeparateVerifierEnvironmentError,
 )
 
@@ -288,6 +291,14 @@ class FakeTrialRelay:
         return None
 
 
+@dataclasses.dataclass(frozen=True)
+class FakeSecretSource:
+    values: frozenset[str]
+
+    def protected_values(self) -> frozenset[str]:
+        return self.values
+
+
 def _agent_environment_mounts(paths: trial_paths.TrialPaths) -> list[dict[str, str]]:
     """The mounts Harbor builds a trial's own environment with (`_agent_env_mounts`)."""
     return [
@@ -318,6 +329,7 @@ def _environment(
     startup_env: dict[str, str] | None = None,
     session_id: str = "trial__env",
     mounts: list[dict[str, str]] | None = None,
+    secrets: object | None = None,
 ) -> RelayEnvironment:
     paths = trial_paths.TrialPaths(tmp_path / "trial")
     return RelayEnvironment(
@@ -333,6 +345,7 @@ def _environment(
         relay={},
         persistent_env={"PERSISTENT": "kept"},
         mounts=_agent_environment_mounts(paths) if mounts is None else mounts,
+        secrets=secrets,
     )
 
 
@@ -409,6 +422,57 @@ async def test_delegates_environment_methods_and_default_user_to_the_inner_envir
         ("stop_service", ("sidecar",), {}),
         ("prepare_logs_for_host", (), {}),
     ]
+
+
+@pytest.mark.parametrize(
+    "leaked_value",
+    ["runner-secret-value-123", "Bearer runner-secret-value-123"],
+)
+async def test_exec_refuses_a_runner_secret_under_any_environment_name(
+    tmp_path: Path, leaked_value: str
+) -> None:
+    environment = _environment(
+        tmp_path, secrets=FakeSecretSource(frozenset({"runner-secret-value-123"}))
+    )
+
+    with pytest.raises(RunnerSecretExposureError, match="EXTRA_AUTH") as raised:
+        _ = await environment.exec("echo unsafe", env={"EXTRA_AUTH": leaked_value})
+
+    assert "runner-secret-value-123" not in str(raised.value)
+    assert [call.name for call in _inner().calls] == [
+        "_validate_definition",
+        "_validate_definition",
+    ]
+
+
+async def test_exec_refuses_a_runner_secret_the_runner_hid_from_its_environment(
+    tmp_path: Path,
+) -> None:
+    hidden = "hidden-request-secret-0123"
+    environment = _environment(tmp_path, secrets=FakeSecretSource(frozenset({hidden})))
+
+    with pytest.raises(RunnerSecretExposureError, match="PLAIN") as raised:
+        _ = await environment.exec("echo unsafe", env={"PLAIN": f"value {hidden}"})
+
+    assert hidden not in str(raised.value)
+    assert "exec" not in [call.name for call in _inner().calls]
+
+
+async def test_start_refuses_a_runner_secret_hidden_in_the_provider_startup_environment(
+    tmp_path: Path,
+) -> None:
+    runner_secret = "runner-secret-value-123"
+    environment = _environment(
+        tmp_path,
+        startup_env={"EXTRA_AUTH": f"Bearer {runner_secret}"},
+        secrets=FakeSecretSource(frozenset({runner_secret})),
+    )
+
+    with pytest.raises(RunnerSecretExposureError, match="EXTRA_AUTH") as raised:
+        await environment.start(force_build=True)
+
+    assert runner_secret not in str(raised.value)
+    assert not [call for call in _inner().calls if call.name == "start"]
 
 
 async def test_exec_replaces_provider_credentials_for_each_relay_phase(
@@ -1623,6 +1687,21 @@ async def test_delegates_service_operations_and_streams_inner_output(
     assert streamed == [("streamed output", "stdout")]
 
 
+async def test_service_exec_refuses_a_runner_secret(tmp_path: Path) -> None:
+    secret = "runner-secret-value-123"
+    environment = _environment(tmp_path, secrets=FakeSecretSource(frozenset({secret})))
+
+    with pytest.raises(RunnerSecretExposureError, match="EXTRA_AUTH") as raised:
+        _ = await environment.service_exec(
+            "collect logs",
+            service="sidecar",
+            env={"EXTRA_AUTH": f"Bearer {secret}"},
+        )
+
+    assert secret not in str(raised.value)
+    assert not [call for call in _inner().calls if call.name == "service_exec"]
+
+
 def test_managed_provider_variables_include_vertex_credentials() -> None:
     assert {"VERTEX_API_KEY", "GOOGLE_VERTEX_BASE_URL"} <= MANAGED_PROVIDER_VARIABLES
 
@@ -1661,3 +1740,148 @@ def test_a_separate_verifier_environment_is_refused_naming_the_mode(
 
     assert _inner() is provider
     assert relay_environment.ENVIRONMENTS == {"trial": environment}
+
+
+_SEPARATE_VERIFIER_PROBE = """
+from __future__ import annotations
+
+from pathlib import Path
+
+from harbor.environments.base import BaseEnvironment, ExecResult
+from harbor.models.verifier.result import VerifierResult
+from harbor.verifier.base import BaseVerifier
+
+
+class NoopEnvironment(BaseEnvironment):
+    @staticmethod
+    def type() -> str:
+        return "noop"
+
+    def _validate_definition(self) -> None:
+        pass
+
+    async def start(self, force_build: bool) -> None:
+        del force_build
+
+    async def stop(self, delete: bool) -> None:
+        del delete
+
+    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+        del source_path, target_path
+
+    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        del source_dir, target_dir
+
+    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+        del source_path, target_path
+
+    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+        del source_dir, target_dir
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        del command, cwd, env, timeout_sec, user
+        return ExecResult(return_code=0)
+
+
+class RewardVerifier(BaseVerifier):
+    async def verify(self) -> VerifierResult:
+        return VerifierResult(rewards={"reward": 1})
+"""
+
+
+_HARBOR_RUN = """
+import sys
+
+from harbor.cli.main import app
+from typer.main import get_command
+
+get_command(app).main(
+    args=["run", "--config", sys.argv[1], "--yes"],
+    prog_name="harbor",
+    standalone_mode=False,
+)
+"""
+
+
+@pytest.mark.parametrize(
+    ("mode", "exception_type"),
+    [
+        pytest.param("shared", None, id="shared"),
+        pytest.param("separate", "SeparateVerifierEnvironmentError", id="separate"),
+    ],
+)
+def test_real_harbor_builds_the_trials_environment_and_refuses_a_separate_verifier(
+    tmp_path: Path, mode: str, exception_type: str | None
+) -> None:
+    """A real Harbor job scores shared verifier mode and refuses separate mode."""
+    probe = "relay_environment_probe"
+    (tmp_path / f"{probe}.py").write_text(
+        textwrap.dedent(_SEPARATE_VERIFIER_PROBE), encoding="utf-8"
+    )
+    task_dir = tmp_path / "tasks" / "task"
+    for directory in ("environment", "tests", "solution"):
+        (task_dir / directory).mkdir(parents=True)
+    (task_dir / "environment" / "Dockerfile").write_text(
+        "FROM scratch\n", encoding="utf-8"
+    )
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (task_dir / "solution" / "solve.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (task_dir / "instruction.md").write_text("Do the task.\n", encoding="utf-8")
+    (task_dir / "task.toml").write_text(
+        f'[verifier]\nenvironment_mode = "{mode}"\n', encoding="utf-8"
+    )
+    jobs_dir = tmp_path / "jobs"
+    config_file = tmp_path / "harbor-job.json"
+    config_file.write_text(
+        json.dumps(
+            {
+                "job_name": "separate-probe",
+                "jobs_dir": str(jobs_dir),
+                "agents": [{"name": "oracle"}],
+                "environment": {
+                    "import_path": (
+                        "harbor_sandbox_agent_proxy.environment:RelayEnvironment"
+                    ),
+                    "kwargs": {
+                        "environment": {"import_path": f"{probe}:NoopEnvironment"},
+                        "relay": {"declared_models": ["test-model"]},
+                    },
+                },
+                "verifier": {"import_path": f"{probe}:RewardVerifier"},
+                "tasks": [{"path": str(task_dir)}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    child = subprocess.run(
+        [sys.executable, "-c", _HARBOR_RUN, str(config_file)],
+        env=os.environ | {"PYTHONPATH": str(tmp_path)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert child.returncode == 0, child.stderr
+    results = sorted((jobs_dir / "separate-probe").glob("*/result.json"))
+    assert len(results) == 1, child.stdout
+    result = json.loads(results[0].read_text(encoding="utf-8"))
+    if exception_type is None:
+        assert result["exception_info"] is None, result["exception_info"]
+        assert result["verifier_result"]["rewards"] == {"reward": 1}
+    else:
+        assert result["exception_info"]["exception_type"] == exception_type
+        assert (
+            "separate verifier environment"
+            in result["exception_info"]["exception_message"]
+        )
+        assert result["verifier_result"] is None

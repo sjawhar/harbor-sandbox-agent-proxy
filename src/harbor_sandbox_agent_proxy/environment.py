@@ -55,6 +55,7 @@ MANAGED_PROVIDER_VARIABLES = frozenset(
         "CLAUDE_CODE_OAUTH_TOKEN",
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
         "GOOGLE_GEMINI_BASE_URL",
         "OPENAI_API_BASE",
         "OPENAI_API_KEY",
@@ -67,6 +68,10 @@ MANAGED_PROVIDER_VARIABLES = frozenset(
 
 class SeparateVerifierEnvironmentError(RuntimeError):
     """The relay needs Harbor's shared trial environment for verification."""
+
+
+class RunnerSecretExposureError(RuntimeError):
+    """A protected host value would be exposed to a Harbor trial."""
 
 
 SEPARATE_VERIFIER_UNSUPPORTED = (
@@ -315,8 +320,6 @@ class _RelayPhase(Protocol):
 
     async def close(self) -> object: ...
 
-    def protected_values(self) -> Collection[str]: ...
-
 
 @runtime_checkable
 class _RemoteExecutable(Protocol):
@@ -328,8 +331,8 @@ class RelayEnvironment(BaseEnvironment):
 
     _inner: BaseEnvironment
     _secrets: SecretSource
+    _configured_environments: tuple[tuple[str, Mapping[str, str]], ...]
     _tests_mirror: _TestsMirror | None
-    relay: _RelayPhase | None
 
     def __init__(
         self,
@@ -373,6 +376,10 @@ class RelayEnvironment(BaseEnvironment):
             confined_kwargs["persistent_env"] = _without_protected(
                 persistent_env, protected
             )
+        self._configured_environments = (
+            ("the task environment", resolved_task_env),
+            ("the persistent environment", persistent_env or {}),
+        )
 
         raw_path = environment.get("import_path")
         if not isinstance(raw_path, str):
@@ -429,7 +436,6 @@ class RelayEnvironment(BaseEnvironment):
 
     def attach_relay(self, relay: _RelayPhase) -> None:
         self.relay = relay
-        self._secrets = _RelaySecrets(relay)
         ENVIRONMENTS[self.trial_paths.trial_dir.name] = self
 
     def _validate_definition(self) -> None:
@@ -437,10 +443,15 @@ class RelayEnvironment(BaseEnvironment):
 
     @override
     def _startup_env(self) -> dict[str, str]:
-        return self._confined(self._inner._startup_env()) or {}
+        startup_env = self._inner._startup_env()
+        self._refuse_protected(startup_env, where="the sandbox's startup environment")
+        return (
+            self._confined(startup_env, where="the sandbox's startup environment") or {}
+        )
 
     @override
     async def start(self, force_build: bool) -> None:
+        self._refuse_configured_protected()
         _ = self._startup_env()
         self._tests_mirror = None
         await self._inner.start(force_build)
@@ -459,12 +470,11 @@ class RelayEnvironment(BaseEnvironment):
             raise RuntimeError(
                 "Could not inspect the started sandbox environment for protected values"
             )
-        protected = self._secrets.protected_values()
         for assignment in (result.stdout or "").splitlines():
             name, separator, value = assignment.partition("=")
-            if separator and any(secret and secret in value for secret in protected):
-                raise RuntimeError(
-                    "Started sandbox environment contains a protected value in " + name
+            if separator:
+                self._refuse_protected(
+                    {name: value}, where="the started sandbox environment"
                 )
 
     async def _stop_after_failed_start(self, error: BaseException) -> None:
@@ -667,7 +677,7 @@ class RelayEnvironment(BaseEnvironment):
             command,
             service=service,
             cwd=cwd,
-            env=self._confined(env),
+            env=self._confined(env, where="a service exec environment"),
             timeout_sec=timeout_sec,
             user=user,
         )
@@ -772,30 +782,46 @@ class RelayEnvironment(BaseEnvironment):
         return await self._inner.exec(
             command,
             cwd=cwd,
-            env=self._confined(env),
+            env=self._confined(env, where="an exec environment"),
             timeout_sec=timeout_sec,
             user=user,
         )
 
-    def _confined(self, env: dict[str, str] | None) -> dict[str, str] | None:
+    def _refuse_configured_protected(self) -> None:
+        for where, environment in self._configured_environments:
+            self._refuse_protected(environment, where=where)
+
+    def _refuse_protected(
+        self, environment: Mapping[str, str] | None, *, where: str
+    ) -> None:
+        if not environment:
+            return
+        protected = self._secrets.protected_values()
+        exposed = sorted(
+            name
+            for name, value in environment.items()
+            if any(secret and secret in value for secret in protected)
+        )
+        if exposed:
+            raise RunnerSecretExposureError(
+                f"{where} carries a protected value under {', '.join(exposed)}; "
+                + "protected values never enter a Harbor trial"
+            )
+
+    def _confined(
+        self, env: dict[str, str] | None, *, where: str
+    ) -> dict[str, str] | None:
         merged = self._merge_env(env) or {}
-        confined = _without_protected(merged, self._secrets.protected_values())
         if self.relay is not None:
-            confined = {
+            merged = {
                 name: value
-                for name, value in confined.items()
+                for name, value in merged.items()
                 if name not in MANAGED_PROVIDER_VARIABLES
             }
-            confined.update(self.relay.phase_env())
-        return confined or None
-
-
-class _RelaySecrets:
-    def __init__(self, relay: _RelayPhase) -> None:
-        self._relay = relay
-
-    def protected_values(self) -> Collection[str]:
-        return self._relay.protected_values()
+        self._refuse_protected(merged, where=where)
+        if self.relay is not None:
+            merged.update(self.relay.phase_env())
+        return merged or None
 
 
 ENVIRONMENTS: dict[str, RelayEnvironment] = {}

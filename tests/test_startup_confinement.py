@@ -5,11 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import ClassVar, override
 
+import pytest
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
 
-from harbor_sandbox_agent_proxy.environment import RelayEnvironment
+from harbor_sandbox_agent_proxy.environment import (
+    RelayEnvironment,
+    RunnerSecretExposureError,
+)
 
 
 class StartupRecordingEnvironment(BaseEnvironment):
@@ -85,7 +89,7 @@ class StartupRecordingEnvironment(BaseEnvironment):
         return ExecResult(return_code=0)
 
 
-async def test_inner_startup_environment_removes_templated_host_key(
+async def test_inner_startup_environment_refuses_templated_host_key(
     tmp_path: Path, monkeypatch
 ) -> None:
     host_key = "host-key-not-for-sandbox"
@@ -100,7 +104,7 @@ async def test_inner_startup_environment_removes_templated_host_key(
         relay={"declared_models": ["test-model"]},
     )
 
-    await environment.start(False)
+    with pytest.raises(RunnerSecretExposureError, match="OPENAI_API_KEY") as error:
+        await environment.start(False)
 
-    assert StartupRecordingEnvironment.latest is not None
-    assert StartupRecordingEnvironment.latest.seen_startup == {}
+    assert host_key not in str(error.value)
