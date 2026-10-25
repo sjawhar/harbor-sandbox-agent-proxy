@@ -1,0 +1,85 @@
+[project]
+name = "harbor-sandbox-agent-proxy"
+version = "0.1.0.dev0"
+description = "Harbor wrappers that relay sandbox-agent model calls through the host"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "Sami Jawhar" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "anyio",
+    "httpx",
+    "inspect-ai>=0.3.278",
+    "pydantic>=2",
+]
+
+[project.urls]
+Repository = "https://github.com/sjawhar/harbor-sandbox-agent-proxy"
+Issues = "https://github.com/sjawhar/harbor-sandbox-agent-proxy/issues"
+
+[project.entry-points."harbor.plugins"]
+sandbox-agent-proxy = "harbor_sandbox_agent_proxy.plugin:SandboxAgentProxyPlugin"
+
+[project.optional-dependencies]
+harbor = [
+    "harbor>=0.23.0,<0.25",
+    "mcp>=1.23.0",
+]
+providers = [
+    "anthropic>=1.5.0",
+    "google-genai>=1.69.0",
+    "openai>=3.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harbor_sandbox_agent_proxy"]
+
+[dependency-groups]
+dev = [
+    "basedpyright",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.16.5",
+]
+
+[tool.pyright]
+reportAny = false
+reportExplicitAny = false
+reportMissingModuleSource = false
+reportUnusedCallResult = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "e2e: end-to-end tests",
+    "docker: tests requiring Docker",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+format.exclude = ["*.md"]
+lint.select = ["E4", "E7", "E9", "F"]
+lint.extend-select = ["ANN0", "ANN2", "B006", "BLE001", "E701", "E702", "FA102", "FURB", "I", "PLR0915"]
+lint.pydocstyle.convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["ANN0", "ANN2"]
+"**/test_*.py" = ["ANN0", "ANN2"]
+"**/conftest.py" = ["ANN0", "ANN2"]
+
+[tool.uv]
+override-dependencies = ["openai>=3.1.0"]
