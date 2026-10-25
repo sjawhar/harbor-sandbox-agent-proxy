@@ -11,7 +11,14 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.trial.config import AgentConfig
 
-from .collaborators import DefaultSecretSource, DefaultUpstream, SecretSource, Upstream
+from .collaborators import (
+    BridgedToolServerProvider,
+    DefaultBridgedToolServerProvider,
+    DefaultSecretSource,
+    DefaultUpstream,
+    SecretSource,
+    Upstream,
+)
 from .config import RelayConfig
 from .outcome import EventSinkFactory, JsonOutcomeSink, TrialIdentity
 from .registry import resolve_collaborator
@@ -28,6 +35,7 @@ class RelayAgent(BaseAgent):
     _inner: BaseAgent
     _relay: TrialRelay | None
     _sink_factory: EventSinkFactory | None
+    _bridged_tool_server_provider: BridgedToolServerProvider
 
     def __init__(
         self,
@@ -38,6 +46,7 @@ class RelayAgent(BaseAgent):
         upstream: object | None = None,
         secrets: object | None = None,
         event_sink_factory: object | None = None,
+        bridged_tool_server_provider: object | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir, **kwargs)
@@ -46,6 +55,9 @@ class RelayAgent(BaseAgent):
         self._upstream = _upstream(upstream)
         self._secrets = _secrets(secrets, self._upstream)
         self._sink_factory = _sink_factory(event_sink_factory)
+        self._bridged_tool_server_provider = _bridged_tool_server_provider(
+            bridged_tool_server_provider
+        )
         self._inner = AgentFactory.create_agent_from_config(
             self._inner_config,
             logs_dir=logs_dir,
@@ -108,6 +120,9 @@ class RelayAgent(BaseAgent):
                 upstream=self._upstream,
                 sink=sink,
                 declared_models=frozenset(self._config.declared_models),
+                bridged_servers=await self._bridged_tool_server_provider.servers_for(
+                    identity.name
+                ),
                 secrets=self._secrets,
                 port=self._config.port,
                 environment=environment,
@@ -161,4 +176,17 @@ def _sink_factory(value: object | None) -> EventSinkFactory | None:
     candidate = resolve_collaborator(value, label="event_sink_factory")
     if not isinstance(candidate, EventSinkFactory):
         raise TypeError("event_sink_factory must implement open")
+    return candidate
+
+
+def _bridged_tool_server_provider(
+    value: object | None,
+) -> BridgedToolServerProvider:
+    candidate = (
+        DefaultBridgedToolServerProvider()
+        if value is None
+        else resolve_collaborator(value, label="bridged_tool_server_provider")
+    )
+    if not isinstance(candidate, BridgedToolServerProvider):
+        raise TypeError("bridged_tool_server_provider must implement servers_for")
     return candidate

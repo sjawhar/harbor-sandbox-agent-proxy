@@ -54,10 +54,19 @@ class BridgedMcpServer:
     require_proposal: bool = True
 
 
+@runtime_checkable
 class BridgedToolServerProvider(Protocol):
     """Supplies task-specific bridged tool servers for a single trial."""
 
     async def servers_for(self, trial_name: str) -> Sequence[BridgedMcpServer]: ...
+
+
+class DefaultBridgedToolServerProvider:
+    """Expose no bridged tools unless a host supplies task-specific servers."""
+
+    async def servers_for(self, trial_name: str) -> Sequence[BridgedMcpServer]:
+        del trial_name
+        return ()
 
 
 @dataclasses.dataclass(frozen=True)

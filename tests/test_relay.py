@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 
 from harbor_sandbox_agent_proxy.collaborators import DefaultUpstream
@@ -66,3 +68,104 @@ async def test_default_host_key_stays_out_of_sandbox_environment_and_json_outcom
 
     assert host_key not in sandbox_environment.values()
     assert host_key not in outcome
+
+
+async def test_client_tool_search_stays_in_a_bridged_only_responses_request() -> None:
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"output": []})
+
+    calls: list[RelayCall] = []
+
+    async def record(call: RelayCall) -> None:
+        calls.append(call)
+
+    policy = RelayPolicy(
+        caller_key="sandbox-key",
+        allowed_models=frozenset({"gpt"}),
+        tools="bridged-only",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        methods = relay_methods(
+            lambda: ("agent", policy),
+            DefaultUpstream({"OPENAI_API_KEY": "host-key"}),
+            record=record,
+            client=client,
+        )
+        await methods["generate_responses"](
+            {
+                "model": "gpt",
+                "input": "use the tool",
+                "tools": [{"type": "tool_search", "execution": "client"}],
+            },
+            {"authorization": "Bearer sandbox-key"},
+        )
+
+    assert json.loads(seen[0].content)["tools"] == [
+        {"type": "tool_search", "execution": "client"}
+    ]
+    assert calls[0].stripped == ()
+
+
+async def test_bridged_only_keeps_a_bridged_responses_namespace() -> None:
+    seen: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"output": []})
+
+    calls: list[RelayCall] = []
+
+    async def record(call: RelayCall) -> None:
+        calls.append(call)
+
+    policy = RelayPolicy(
+        caller_key="sandbox-key",
+        allowed_models=frozenset({"gpt"}),
+        tools="bridged-only",
+        bridged={"e2e-tools": frozenset({"echo"})},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        methods = relay_methods(
+            lambda: ("agent", policy),
+            DefaultUpstream({"OPENAI_API_KEY": "host-key"}),
+            record=record,
+            client=client,
+        )
+        await methods["generate_responses"](
+            {
+                "model": "gpt",
+                "input": "use the tool",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "mcp__e2e_tools",
+                        "tools": [
+                            {"type": "function", "name": "echo"},
+                            {"type": "function", "name": "not-served"},
+                        ],
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "mcp__unbridged",
+                        "tools": [{"type": "function", "name": "shell"}],
+                    },
+                ],
+            },
+            {"authorization": "Bearer sandbox-key"},
+        )
+
+    assert json.loads(seen[0].content)["tools"] == [
+        {
+            "type": "namespace",
+            "name": "mcp__e2e_tools",
+            "tools": [{"type": "function", "name": "echo"}],
+        }
+    ]
+    assert calls[0].stripped == (
+        "tool:mcp__e2e_tools/not-served",
+        "tool:mcp__unbridged/shell",
+        "namespace:mcp__unbridged",
+    )

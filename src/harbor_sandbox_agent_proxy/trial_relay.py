@@ -65,6 +65,9 @@ class TrialRelay:
     _mcp_server_configs: list[MCPServerConfig] = dataclasses.field(
         default_factory=list, init=False, repr=False
     )
+    _bridged_tools: list[BridgedToolsSpec] = dataclasses.field(
+        default_factory=list, init=False, repr=False
+    )
     _closed: bool = False
     environment: HarborEnvironment | None = None
     polling_interval: float | None = None
@@ -108,12 +111,14 @@ class TrialRelay:
         return environment
 
     def current_policy(self) -> tuple[RelayPhase, RelayPolicy]:
+        bridged = {
+            server.name: frozenset(ToolDef(tool).name for tool in server.tools)
+            for server in self._bridged_tools
+        }
         return self.phase, RelayPolicy(
             caller_key=self.agent_key if self.phase == "agent" else self.verifier_key,
             allowed_models=self.declared_models,
-            bridged={server.name: frozenset() for server in self.bridged_servers}
-            if self.phase == "agent"
-            else {},
+            bridged=bridged if self.phase == "agent" else {},
         )
 
     async def record(self, call: RelayCall) -> None:
@@ -244,6 +249,7 @@ class TrialRelay:
                         httpx.AsyncClient(timeout=GATEWAY_TIMEOUT)
                     )
                     bridged_tools = await self._create_bridged_tools(stack)
+                    self._bridged_tools = bridged_tools
                     proxy = await stack.enter_async_context(
                         sandbox_model_proxy(
                             bound_sandbox,

@@ -20,12 +20,7 @@ names the incompatible symbol. It is tested with Inspect AI 0.3.278 and 0.3.285.
 
 ## Status
 
-Pre-release. Not yet on PyPI. Not yet a complete security control:
-
-- The verifier's tests tree is not yet locked from the agent.
-- The Docker e2e runs a stock `harbor run` through the wrappers and the plugin, but its
-  agent makes no model call yet, so relaying a Messages- or Responses-dialect call
-  end to end is not yet proven in Docker (it is unit-tested).
+Pre-release. Not yet on PyPI.
 
 ## Install
 

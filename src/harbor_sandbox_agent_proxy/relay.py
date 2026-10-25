@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import enum
 import hmac
 import json
+import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Literal
+from typing import Final, Literal
 
 import httpx
 import pydantic
@@ -29,6 +31,16 @@ GenerateMethod = Callable[
     [dict[str, pydantic.JsonValue], Mapping[str, str] | None],
     Awaitable[dict[str, pydantic.JsonValue]],
 ]
+
+
+class _ToolKind(enum.StrEnum):
+    CLIENT = "client"
+    NAMESPACE = "namespace"
+    CLIENT_TOOL_SEARCH = "client-tool-search"
+    SERVER = "server"
+
+
+_CODEX_UNSAFE_NAME_CHARS: Final = re.compile(r"[^A-Za-z0-9_]")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,16 +81,34 @@ class RelayPolicy:
     def permits_tool(self, name: str | None) -> bool:
         if self.tools == "any":
             return True
-        if name is None:
+        if not name:
             return False
-        if name in self.permitted_tool_names or name.startswith(
-            self.permitted_tool_prefixes
-        ):
+        if name in self.permitted_tool_names:
             return True
-        return any(
-            name.startswith(f"mcp__{server}__")
-            and name.removeprefix(f"mcp__{server}__") in tools
-            for server, tools in self.bridged.items()
+        for server, served in self.bridged.items():
+            for prefix in bridged_tool_prefixes(server):
+                if name.startswith(prefix):
+                    return name.removeprefix(prefix) in served
+        return name.startswith(self.permitted_tool_prefixes)
+
+    def namespace_tools(self, namespace: str | None) -> frozenset[str] | None:
+        """Return a bridged server's tools when ``namespace`` is its own."""
+        if not namespace:
+            return None
+        for server, served in self.bridged.items():
+            if namespace == bridged_namespace(server):
+                return served
+        return None
+
+    def permits_namespaced_tool(self, namespace: str | None, name: str | None) -> bool:
+        """Return whether a Responses namespace tool is within this phase's surface."""
+        if self.tools == "any":
+            return True
+        if not name:
+            return False
+        served = self.namespace_tools(namespace)
+        return name in self.permitted_tool_names or (
+            served is not None and name in served
         )
 
 
@@ -89,10 +119,7 @@ def mint_caller_key() -> str:
 
 def bridged_namespace(server: str) -> str:
     """Return the Responses namespace form of a bridged server name."""
-    return "mcp__" + "".join(
-        character if character.isalnum() or character == "_" else "_"
-        for character in server
-    )
+    return "mcp__" + _CODEX_UNSAFE_NAME_CHARS.sub("_", server)
 
 
 def bridged_tool_prefixes(server: str) -> tuple[str, ...]:
@@ -113,14 +140,14 @@ def relay_methods(
 
     def handler(method: str, dialect: RequestDialect) -> GenerateMethod:
         async def forward(
-            body: dict[str, pydantic.JsonValue],
-            incoming_headers: Mapping[str, str] | None = None,
+            json_data: dict[str, pydantic.JsonValue],
+            headers: Mapping[str, str] | None = None,
         ) -> dict[str, pydantic.JsonValue]:
             phase, policy = policy_getter()
             started = datetime.datetime.now(datetime.UTC)
-            model = _model(body.get("model"))
-            request = body
-            if not _authenticated(incoming_headers, policy.caller_key):
+            model = _model(json_data.get("model"))
+            request = json_data
+            if not _authenticated(headers, policy.caller_key):
                 return await _refuse(
                     record,
                     phase=phase,
@@ -145,7 +172,7 @@ def relay_methods(
                     request.pop("model", None)
                 target = await upstream.resolve(dialect=dialect, model=model or "")
                 headers, beta_stripped = _headers(
-                    target.headers, dialect, incoming_headers, policy
+                    target.headers, dialect, headers, policy
                 )
                 stripped.extend(beta_stripped)
                 response = await client.post(target.url, json=request, headers=headers)
@@ -371,34 +398,149 @@ async def _refuse(
 def _confine(
     body: dict[str, pydantic.JsonValue], dialect: RequestDialect, policy: RelayPolicy
 ) -> list[str]:
-    """Remove provider-owned tools and account-file references from a request in place."""
-    del dialect
-    stripped: list[str] = []
-    tools = body.get("tools")
-    if isinstance(tools, list):
-        kept: list[pydantic.JsonValue] = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                stripped.append("tool:malformed")
-                continue
-            name = _tool_name(tool)
-            kind = tool.get("type")
-            client_tool = kind in {None, "function", "custom"}
-            if not client_tool:
-                stripped.append(f"server-tool:{kind}")
-            elif policy.permits_tool(name):
-                kept.append(tool)
-            else:
-                stripped.append(f"tool:{name}")
-        if kept:
-            body["tools"] = kept
-        else:
-            body.pop("tools", None)
+    """Remove provider tools and account-file references from a request in place."""
+    stripped = (
+        _confine_responses_tools(body, policy)
+        if dialect is RequestDialect.RESPONSES
+        else _confine_standard_tools(body, policy)
+    )
     for key in ("mcp_servers", "container", "tool_resources"):
         if key in body:
             body.pop(key)
             stripped.append(key)
     _strip_file_references(body, stripped)
+    return stripped
+
+
+def _confine_standard_tools(
+    body: dict[str, pydantic.JsonValue], policy: RelayPolicy
+) -> list[str]:
+    """Confine non-Responses client tools in place."""
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return []
+    stripped: list[str] = []
+    kept: list[pydantic.JsonValue] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            stripped.append("tool:malformed")
+            continue
+        name = _tool_name(tool)
+        kind = tool.get("type")
+        if kind not in {None, "function", "custom"}:
+            stripped.append(f"server-tool:{kind}")
+        elif policy.permits_tool(name):
+            kept.append(tool)
+        else:
+            stripped.append(f"tool:{name}")
+    if kept:
+        body["tools"] = kept
+    else:
+        body.pop("tools", None)
+    return stripped
+
+
+def _responses_tool(
+    tool: dict[str, pydantic.JsonValue],
+) -> tuple[_ToolKind, str | None]:
+    """Classify a Responses tool as client-owned or provider-owned."""
+    kind = tool.get("type")
+    name = tool.get("name")
+    tool_name = name if isinstance(name, str) else None
+    if kind in {"function", "custom"}:
+        return _ToolKind.CLIENT, tool_name
+    if kind == "namespace":
+        return _ToolKind.NAMESPACE, tool_name
+    if kind == "tool_search" and tool.get("execution") == "client":
+        return _ToolKind.CLIENT_TOOL_SEARCH, "tool_search"
+    return _ToolKind.SERVER, str(kind) if kind is not None else "untyped"
+
+
+def _confine_responses_tool_list(
+    tools: list[pydantic.JsonValue], policy: RelayPolicy
+) -> tuple[list[pydantic.JsonValue], list[str]]:
+    """Return the Responses tools this phase admits and the tools it removed."""
+    stripped: list[str] = []
+    kept: list[pydantic.JsonValue] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            stripped.append("tool:malformed")
+            continue
+        kind, name = _responses_tool(tool)
+        if kind is _ToolKind.SERVER:
+            stripped.append(f"server-tool:{name}")
+        elif kind is _ToolKind.CLIENT_TOOL_SEARCH:
+            kept.append(tool)
+        elif kind is _ToolKind.CLIENT:
+            if policy.permits_tool(name):
+                kept.append(tool)
+            else:
+                stripped.append(f"tool:{name}")
+        else:
+            namespace, namespace_stripped = _confine_responses_namespace(
+                tool, name, policy
+            )
+            stripped.extend(namespace_stripped)
+            if namespace is not None:
+                kept.append(namespace)
+    return kept, stripped
+
+
+def _confine_responses_namespace(
+    namespace: dict[str, pydantic.JsonValue],
+    name: str | None,
+    policy: RelayPolicy,
+) -> tuple[dict[str, pydantic.JsonValue] | None, list[str]]:
+    """Confine client functions nested in one Responses namespace."""
+    stripped: list[str] = []
+    kept: list[pydantic.JsonValue] = []
+    tools = namespace.get("tools")
+    for tool in tools if isinstance(tools, list) else []:
+        if not isinstance(tool, dict):
+            stripped.append(f"tool:{name}/malformed")
+            continue
+        kind, tool_name = _responses_tool(tool)
+        if kind is _ToolKind.SERVER:
+            stripped.append(f"server-tool:{tool_name}")
+        elif kind is _ToolKind.CLIENT and policy.permits_namespaced_tool(
+            name, tool_name
+        ):
+            kept.append(tool)
+        else:
+            stripped.append(f"tool:{name}/{tool_name}")
+    if not kept:
+        return None, [*stripped, f"namespace:{name}"]
+    return {**namespace, "tools": kept}, stripped
+
+
+def _confine_responses_tools(
+    body: dict[str, pydantic.JsonValue], policy: RelayPolicy
+) -> list[str]:
+    """Apply Responses confinement at each Codex tool declaration site."""
+    stripped: list[str] = []
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        kept, tool_stripped = _confine_responses_tool_list(tools, policy)
+        stripped.extend(tool_stripped)
+        if kept:
+            body["tools"] = kept
+        else:
+            body.pop("tools", None)
+    items = body.get("input")
+    if not isinstance(items, list):
+        return stripped
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") not in {
+            "additional_tools",
+            "tool_search_output",
+        }:
+            continue
+        declared = item.get("tools")
+        if not isinstance(declared, list):
+            continue
+        kept, item_stripped = _confine_responses_tool_list(declared, policy)
+        item["tools"] = kept
+        stripped.extend(item_stripped)
     return stripped
 
 
