@@ -15,6 +15,8 @@ from ._inspect_compat import (
     sandbox_with_environments_context_var,
 )
 
+__all__ = ["bind_sandbox_environment"]
+
 
 @final
 class _SingleSandboxEnvironments(Mapping[str, SandboxEnvironment]):

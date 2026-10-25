@@ -16,6 +16,8 @@ from ._inspect_compat import (
     position_descent,
 )
 
+__all__ = ["BridgeConversation", "BridgeConversationSelector"]
+
 
 class BridgeConversation(NamedTuple):
     """One call's full conversation, as tracked by ``BridgeConversationSelector``."""

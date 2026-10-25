@@ -45,6 +45,13 @@ SandboxServiceMethod = Callable[..., Awaitable[JsonValue]]
 ModelProxyMethod = Callable[..., Awaitable[JsonValue]]
 """A ``sandbox_model_proxy`` handler, called with the keyword arguments the proxy sends."""
 
+__all__ = [
+    "sandbox_model_proxy",
+    "ModelProxy",
+    "ModelProxyError",
+    "ModelProxyMethod",
+]
+
 _GENERATE_METHODS = {
     "generate_completions": "the OpenAI Chat Completions API",
     "generate_responses": "the OpenAI Responses API",

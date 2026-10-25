@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import inspect
 
-from harbor_sandbox_agent_proxy import _inspect_compat as compat
+from harbor_sandbox_agent_proxy import (
+    _inspect_compat as compat,
+)
+from harbor_sandbox_agent_proxy import (
+    conversation,
+    proxy,
+    sandbox_binding,
+)
 
 
 def test_inspect_proxy_seams_accept_the_package_calls() -> None:
@@ -36,3 +43,17 @@ def test_inspect_proxy_seams_accept_the_package_calls() -> None:
         poll_timeout_recovery=None,
     )
     inspect.signature(compat.sandbox_with_injected_tools).bind(sandbox=object())
+
+
+def test_inspect_side_public_api_is_explicit() -> None:
+    assert proxy.__all__ == [
+        "sandbox_model_proxy",
+        "ModelProxy",
+        "ModelProxyError",
+        "ModelProxyMethod",
+    ]
+    assert conversation.__all__ == [
+        "BridgeConversation",
+        "BridgeConversationSelector",
+    ]
+    assert sandbox_binding.__all__ == ["bind_sandbox_environment"]
