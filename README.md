@@ -40,13 +40,16 @@ JSON outcome.
 Hosts that use another routing policy provide collaborators through the wrappers'
 JSON kwargs. Each collaborator can be an object or a `module:attribute` import path:
 
-- `upstream` implements `async resolve(*, dialect, model) -> UpstreamTarget`;
+- `upstream` implements `async resolve(*, dialect, model) -> UpstreamTarget` for
+  sandbox calls and, for a runner-loop agent, `api_base(model=...) -> str`;
 - `secrets` returns host values that must be excluded and redacted;
 - `EventSinkFactory` opens a per-trial record sink; and
 - `BridgedToolServerProvider` supplies per-trial MCP server specifications.
 
-The package keeps no process-wide trial registry. A host integration owns its route
-policy and any transformation of the package's records into its own log format.
+Within one Harbor process, the wrapper agent, wrapper environment, and plugin find
+each other's per-trial state through trial-keyed registries. The environment removes
+its entry when it stops. Host integrations still own route policy and any
+transformation of package records into their own log format.
 
 ```json
 {
