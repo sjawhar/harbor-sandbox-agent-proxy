@@ -20,6 +20,7 @@ from .trial_relay import TrialRelay
 
 class RelayAgent(BaseAgent):
     """Run an inner Harbor agent with a host-mediated sandbox model endpoint."""
+
     _config: RelayConfig
     _inner_config: AgentConfig
     _upstream: Upstream
@@ -27,8 +28,6 @@ class RelayAgent(BaseAgent):
     _inner: BaseAgent
     _relay: TrialRelay | None
     _sink_factory: EventSinkFactory | None
-
-
 
     def __init__(
         self,
@@ -50,10 +49,8 @@ class RelayAgent(BaseAgent):
         self._inner = AgentFactory.create_agent_from_config(
             self._inner_config,
             logs_dir=logs_dir,
-            model_name=self._inner_config.model_name,
-            extra_env=self.extra_env,
         )
-        self._relay: TrialRelay | None = None
+        self._relay = None
 
     @staticmethod
     @override
@@ -69,18 +66,30 @@ class RelayAgent(BaseAgent):
         await self._inner.setup(environment)
 
     @override
-    async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
         await self._run_phase(self._inner.run, instruction, environment, context)
 
     @override
-    async def resume(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+    async def resume(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
         await self._run_phase(self._inner.resume, instruction, environment, context)
 
     @override
-    async def load(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+    async def load(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
         await self._run_phase(self._inner.load, instruction, environment, context)
 
-    async def _run_phase(self, method: Any, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+    async def _run_phase(
+        self,
+        method: Any,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
         relay = self._relay
         if relay is None:
             identity = TrialIdentity(
@@ -110,6 +119,7 @@ class RelayAgent(BaseAgent):
             attach(relay)
             self._relay = relay
             await relay.open_agent_phase()
+            self._inner.mcp_servers.extend(relay.mcp_server_configs())
             self._inner._extra_env.update(relay.phase_env())
         else:
             await relay.resume_agent_phase()

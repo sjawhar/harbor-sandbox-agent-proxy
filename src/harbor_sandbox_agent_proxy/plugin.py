@@ -27,7 +27,12 @@ class SandboxAgentProxyPlugin(BaseJobPlugin):
         del job_result
 
     async def _on_trial_ended(self, event: Any) -> None:
-        outcome_path = Path(event.config.trials_dir) / event.trial_name / "sandbox-agent-proxy" / "outcome.json"
+        outcome_path = (
+            Path(event.config.trials_dir)
+            / event.trial_name
+            / "sandbox-agent-proxy"
+            / "outcome.json"
+        )
         try:
             outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
             counts = outcome.get("counts", {})

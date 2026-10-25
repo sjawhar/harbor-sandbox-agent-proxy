@@ -25,4 +25,6 @@ class RelayConfig(BaseModel):
     max_request_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     max_calls: int = Field(default=10_000, gt=0)
     max_recorded_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
-    conversation_path: PurePosixPath = PurePosixPath("/tests/sandbox-agent-proxy/conversation.json")
+    conversation_path: PurePosixPath = PurePosixPath(
+        "/tests/sandbox-agent-proxy/conversation.json"
+    )

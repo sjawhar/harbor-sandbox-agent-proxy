@@ -45,9 +45,13 @@ class HarborEnvironment(Protocol):
         user: str | int | None = None,
     ) -> HarborExecResult: ...
 
-    async def upload_file(self, source_path: pathlib.Path | str, target_path: str) -> None: ...
+    async def upload_file(
+        self, source_path: pathlib.Path | str, target_path: str
+    ) -> None: ...
 
-    async def download_file(self, source_path: str, target_path: pathlib.Path | str) -> None: ...
+    async def download_file(
+        self, source_path: str, target_path: pathlib.Path | str
+    ) -> None: ...
 
 
 class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
@@ -111,7 +115,9 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
             stderr += result.stderr or ""
         else:
             if timeout is not None and result.return_code == 124:
-                raise TimeoutError(result.stderr or f"Command timed out after {timeout} seconds")
+                raise TimeoutError(
+                    result.stderr or f"Command timed out after {timeout} seconds"
+                )
             stdout, stderr = merged, result.stderr or ""
         return inspect_ai.util.ExecResult(
             success=result.return_code == 0,
@@ -125,9 +131,13 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
         data = contents.encode() if isinstance(contents, str) else contents
         parent = str(pathlib.PurePosixPath(file).parent)
         if parent not in {"", "."}:
-            made = await self._environment.exec(f"mkdir -p {shlex.quote(parent)}", user=_FILE_TRANSFER_USER)
+            made = await self._environment.exec(
+                f"mkdir -p {shlex.quote(parent)}", user=_FILE_TRANSFER_USER
+            )
             if made.return_code != 0:
-                raise PermissionError(made.stderr or made.stdout or f"Could not create {parent}")
+                raise PermissionError(
+                    made.stderr or made.stdout or f"Could not create {parent}"
+                )
         await self._upload_bytes(data, file)
 
     @overload
@@ -155,7 +165,11 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
 
     @override
     def default_polling_interval(self) -> float:
-        return super().default_polling_interval() if self._polling_interval is None else self._polling_interval
+        return (
+            super().default_polling_interval()
+            if self._polling_interval is None
+            else self._polling_interval
+        )
 
     @override
     @classmethod
@@ -176,7 +190,9 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
 
     async def _remove_staged(self, path: str, failure: BaseException | None) -> None:
         try:
-            result = await self._environment.exec(f"rm -f {shlex.quote(path)}", user=_FILE_TRANSFER_USER)
+            result = await self._environment.exec(
+                f"rm -f {shlex.quote(path)}", user=_FILE_TRANSFER_USER
+            )
         except Exception as error:
             if failure is None:
                 raise

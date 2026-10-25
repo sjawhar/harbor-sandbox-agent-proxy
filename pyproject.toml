@@ -57,9 +57,11 @@ dev = [
 ]
 
 [tool.pyright]
+typeCheckingMode = "basic"
 reportAny = false
 reportExplicitAny = false
 reportMissingModuleSource = false
+reportMissingTypeStubs = false
 reportUnusedCallResult = false
 
 [tool.pytest.ini_options]

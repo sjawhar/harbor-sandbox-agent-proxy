@@ -60,7 +60,9 @@ async def test_default_host_key_stays_out_of_sandbox_environment_and_json_outcom
 
     sandbox_environment = relay.phase_env()
     await relay.close()
-    outcome = (tmp_path / "sandbox-agent-proxy" / "outcome.json").read_text(encoding="utf-8")
+    outcome = (tmp_path / "sandbox-agent-proxy" / "outcome.json").read_text(
+        encoding="utf-8"
+    )
 
     assert host_key not in sandbox_environment.values()
     assert host_key not in outcome

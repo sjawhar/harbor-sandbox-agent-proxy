@@ -31,7 +31,9 @@ class UpstreamTarget:
 class Upstream(Protocol):
     """Resolve the destination for one model request."""
 
-    async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget: ...
+    async def resolve(
+        self, *, dialect: RequestDialect, model: str
+    ) -> UpstreamTarget: ...
 
 
 @runtime_checkable
@@ -76,7 +78,9 @@ class DefaultSecretSource:
 class DefaultUpstream:
     """Route to public provider endpoints with a host key read at request time."""
 
-    environment: Mapping[str, str] = dataclasses.field(default_factory=lambda: os.environ)
+    environment: Mapping[str, str] = dataclasses.field(
+        default_factory=lambda: os.environ
+    )
 
     async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget:
         match dialect:
@@ -113,4 +117,8 @@ class DefaultUpstream:
 def _bare_model(model: str) -> str:
     """Remove an optional provider prefix from a model identifier."""
     provider, separator, identifier = model.partition("/")
-    return identifier if separator and provider in {"anthropic", "openai", "google"} else model
+    return (
+        identifier
+        if separator and provider in {"anthropic", "openai", "google"}
+        else model
+    )

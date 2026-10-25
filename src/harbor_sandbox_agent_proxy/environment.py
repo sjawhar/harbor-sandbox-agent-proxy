@@ -92,7 +92,6 @@ class RelayEnvironment(BaseEnvironment):
         self.relay = relay
         self._secrets = _RelaySecrets(relay)
 
-
     def _validate_definition(self) -> None:
         self._inner._validate_definition()
 
@@ -142,9 +141,21 @@ class RelayEnvironment(BaseEnvironment):
     def _confined(self, env: dict[str, str] | None) -> dict[str, str] | None:
         merged = self._merge_env(env) or {}
         protected = self._secrets.protected_values()
-        confined = {name: value for name, value in merged.items() if not any(secret and secret in value for secret in protected)}
+        confined = {
+            name: value
+            for name, value in merged.items()
+            if not any(secret and secret in value for secret in protected)
+        }
         if self.relay is not None:
-            for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "GEMINI_API_KEY"):
+            for name in (
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "GOOGLE_API_KEY",
+                "GOOGLE_GEMINI_BASE_URL",
+                "GEMINI_API_KEY",
+            ):
                 confined.pop(name, None)
             confined.update(self.relay.phase_env())
         return confined or None

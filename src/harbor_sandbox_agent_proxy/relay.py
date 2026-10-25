@@ -71,10 +71,13 @@ class RelayPolicy:
             return True
         if name is None:
             return False
-        if name in self.permitted_tool_names or name.startswith(self.permitted_tool_prefixes):
+        if name in self.permitted_tool_names or name.startswith(
+            self.permitted_tool_prefixes
+        ):
             return True
         return any(
-            name.startswith(f"mcp__{server}__") and name.removeprefix(f"mcp__{server}__") in tools
+            name.startswith(f"mcp__{server}__")
+            and name.removeprefix(f"mcp__{server}__") in tools
             for server, tools in self.bridged.items()
         )
 
@@ -86,7 +89,10 @@ def mint_caller_key() -> str:
 
 def bridged_namespace(server: str) -> str:
     """Return the Responses namespace form of a bridged server name."""
-    return "mcp__" + "".join(character if character.isalnum() or character == "_" else "_" for character in server)
+    return "mcp__" + "".join(
+        character if character.isalnum() or character == "_" else "_"
+        for character in server
+    )
 
 
 def bridged_tool_prefixes(server: str) -> tuple[str, ...]:
@@ -107,7 +113,8 @@ def relay_methods(
 
     def handler(method: str, dialect: RequestDialect) -> GenerateMethod:
         async def forward(
-            body: dict[str, pydantic.JsonValue], incoming_headers: Mapping[str, str] | None = None
+            body: dict[str, pydantic.JsonValue],
+            incoming_headers: Mapping[str, str] | None = None,
         ) -> dict[str, pydantic.JsonValue]:
             phase, policy = policy_getter()
             started = datetime.datetime.now(datetime.UTC)
@@ -130,12 +137,16 @@ def relay_methods(
                     raise _RejectedRequest("request cap exceeded")
                 limiter.reserve(phase, len(encoded), policy)
                 stripped = _confine(request, dialect, policy)
-                if dialect is RequestDialect.CHAT_COMPLETIONS and not request.get("tools"):
+                if dialect is RequestDialect.CHAT_COMPLETIONS and not request.get(
+                    "tools"
+                ):
                     request.pop("parallel_tool_calls", None)
                 if dialect is RequestDialect.GEMINI:
                     request.pop("model", None)
                 target = await upstream.resolve(dialect=dialect, model=model or "")
-                headers, beta_stripped = _headers(target.headers, dialect, incoming_headers, policy)
+                headers, beta_stripped = _headers(
+                    target.headers, dialect, incoming_headers, policy
+                )
                 stripped.extend(beta_stripped)
                 response = await client.post(target.url, json=request, headers=headers)
                 response_body = _response_body(response)
@@ -158,7 +169,11 @@ def relay_methods(
                 )
                 await record(call)
                 if response.is_error:
-                    return _error(response.status_code, _upstream_message(method, response.status_code, response_body), response_body)
+                    return _error(
+                        response.status_code,
+                        _upstream_message(method, response.status_code, response_body),
+                        response_body,
+                    )
                 return _json_object(response_body)
             except _RejectedRequest as error:
                 return await _refuse(
@@ -177,7 +192,9 @@ def relay_methods(
 
     return {
         "generate_anthropic": handler("generate_anthropic", RequestDialect.MESSAGES),
-        "generate_completions": handler("generate_completions", RequestDialect.CHAT_COMPLETIONS),
+        "generate_completions": handler(
+            "generate_completions", RequestDialect.CHAT_COMPLETIONS
+        ),
         "generate_responses": handler("generate_responses", RequestDialect.RESPONSES),
         "generate_google": handler("generate_google", RequestDialect.GEMINI),
     }
@@ -190,7 +207,9 @@ class _PhaseLimiter:
         self._counts: dict[str, int] = {}
         self._bytes: dict[str, int] = {}
 
-    def reserve(self, phase: RelayPhase, request_bytes: int, policy: RelayPolicy) -> None:
+    def reserve(
+        self, phase: RelayPhase, request_bytes: int, policy: RelayPolicy
+    ) -> None:
         count = self._counts.get(phase, 0)
         used = self._bytes.get(phase, 0)
         if count >= policy.max_calls:
@@ -209,7 +228,14 @@ class _RejectedRequest(Exception):
 def _authenticated(headers: Mapping[str, str] | None, key: str) -> bool:
     if headers is None:
         return False
-    supplied = next((value for name, value in headers.items() if name.lower() in {"x-api-key", "authorization"}), "")
+    supplied = next(
+        (
+            value
+            for name, value in headers.items()
+            if name.lower() in {"x-api-key", "authorization"}
+        ),
+        "",
+    )
     if supplied.startswith("Bearer "):
         supplied = supplied.removeprefix("Bearer ")
     return hmac.compare_digest(supplied, key)
@@ -241,7 +267,9 @@ def _headers(
     headers = dict(upstream)
     stripped: list[str] = []
     if dialect is RequestDialect.MESSAGES:
-        headers["anthropic-version"] = _header(incoming, "anthropic-version") or DEFAULT_ANTHROPIC_VERSION
+        headers["anthropic-version"] = (
+            _header(incoming, "anthropic-version") or DEFAULT_ANTHROPIC_VERSION
+        )
         beta = _header(incoming, "anthropic-beta")
         if beta:
             kept: list[str] = []
@@ -256,11 +284,17 @@ def _headers(
 
 
 def _header(headers: Mapping[str, str] | None, name: str) -> str | None:
-    return next((value for key, value in (headers or {}).items() if key.lower() == name), None)
+    return next(
+        (value for key, value in (headers or {}).items() if key.lower() == name), None
+    )
 
 
 def _safe_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    return {key: value for key, value in headers.items() if key.lower() not in {"authorization", "x-api-key", "x-goog-api-key"}}
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in {"authorization", "x-api-key", "x-goog-api-key"}
+    }
 
 
 def _response_body(response: httpx.Response) -> pydantic.JsonValue:
@@ -296,7 +330,9 @@ def _upstream_message(method: str, status: int, body: pydantic.JsonValue) -> str
     return f"{method}: upstream returned HTTP {status}"
 
 
-def _error(status: int | None, message: str, body: pydantic.JsonValue | None) -> dict[str, pydantic.JsonValue]:
+def _error(
+    status: int | None, message: str, body: pydantic.JsonValue | None
+) -> dict[str, pydantic.JsonValue]:
     detail: dict[str, pydantic.JsonValue] = {"status": status, "message": message}
     if body is not None:
         detail["body"] = body
