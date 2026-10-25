@@ -33,7 +33,9 @@ uv add 'harbor-sandbox-agent-proxy[harbor,providers] @ git+https://github.com/sj
 Configure both wrappers with the same `relay` value. The package's default
 `Upstream` resolves the public provider endpoint on every request and reads only the
 corresponding host environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
-`GEMINI_API_KEY`). That value is never copied into the sandbox or the JSON outcome.
+`GEMINI_API_KEY`). The wrapper removes protected values from the environment it gives
+Harbor, refuses to run a trial whose started sandbox environment contains one, and never
+writes one to the JSON outcome.
 
 Hosts that use another routing policy provide collaborators through the wrappers'
 JSON kwargs. Each collaborator can be an object or a `module:attribute` import path:
