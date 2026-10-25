@@ -76,6 +76,7 @@ def _without_protected(
         if not any(secret and secret in value for secret in protected)
     }
 
+
 def _mirror_check(
     holder: PurePosixPath, *, copy: PurePosixPath | None = None
 ) -> tuple[str, ...]:
