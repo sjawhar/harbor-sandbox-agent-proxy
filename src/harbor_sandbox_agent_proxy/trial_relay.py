@@ -38,7 +38,6 @@ from .relay import (
 )
 from .sandbox_adapter import HarborEnvironment
 
-
 _AGENT_ENVIRONMENT: Mapping[str, tuple[str, str]] = {
     "messages": ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
     "chat-completions": ("OPENAI_BASE_URL", "OPENAI_API_KEY"),
