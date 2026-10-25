@@ -15,6 +15,7 @@ from .collaborators import DefaultSecretSource, DefaultUpstream, SecretSource, U
 from .config import RelayConfig
 from .outcome import EventSinkFactory, JsonOutcomeSink, TrialIdentity
 from .registry import resolve_collaborator
+from .trial_relay import TrialRelay
 
 
 class RelayAgent(BaseAgent):
