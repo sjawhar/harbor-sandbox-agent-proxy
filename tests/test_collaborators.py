@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from harbor_sandbox_agent_proxy.collaborators import DefaultSecretSource, DefaultUpstream, RequestDialect
+from harbor_sandbox_agent_proxy.collaborators import (
+    DefaultSecretSource,
+    DefaultUpstream,
+    RequestDialect,
+)
 
 
 async def test_default_upstream_reads_the_host_key_for_each_request() -> None:

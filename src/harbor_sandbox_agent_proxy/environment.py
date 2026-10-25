@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, override
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import EnvironmentCapabilities
-from harbor.models.task.config import EnvironmentConfig
+from harbor.models.task.config import EnvironmentConfig, TaskOS
 from harbor.models.trial.paths import TrialPaths
 from harbor.utils.import_path import import_class
 
@@ -54,7 +56,7 @@ class RelayEnvironment(BaseEnvironment):
             **kwargs,
         )
         source = (
-            DefaultSecretSource({})
+            DefaultSecretSource(os.environ)
             if secrets is None
             else resolve_collaborator(secrets, label="secrets")
         )
@@ -83,7 +85,7 @@ class RelayEnvironment(BaseEnvironment):
 
     @property
     @override
-    def os(self):
+    def os(self) -> TaskOS:
         return self._inner.os
 
     def attach_relay(self, relay: TrialRelay) -> None:
@@ -93,6 +95,10 @@ class RelayEnvironment(BaseEnvironment):
 
     def _validate_definition(self) -> None:
         self._inner._validate_definition()
+
+    @override
+    def _startup_env(self) -> dict[str, str]:
+        return self._confined(self._inner._startup_env()) or {}
 
     async def start(self, force_build: bool) -> None:
         await self._inner.start(force_build)
@@ -148,5 +154,5 @@ class _RelaySecrets:
     def __init__(self, relay: TrialRelay) -> None:
         self._relay = relay
 
-    def protected_values(self):
+    def protected_values(self) -> Collection[str]:
         return self._relay.protected_values()

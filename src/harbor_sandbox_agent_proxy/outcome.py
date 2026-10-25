@@ -6,7 +6,7 @@ import dataclasses
 import json
 from collections.abc import Collection, Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import pydantic
 
@@ -48,6 +48,7 @@ class EventSink(Protocol):
     async def close(self, outcome: RelayOutcome) -> None: ...
 
 
+@runtime_checkable
 class EventSinkFactory(Protocol):
     """Open a fresh event sink for each trial."""
 

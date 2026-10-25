@@ -15,6 +15,8 @@ HARBOR_TEST_MODULES: Final = (
     "test_relay_agent.py",
     "test_relay_environment.py",
     "test_plugin.py",
+    "test_environment.py",
+    "test_wrappers.py",
     "e2e",
 )
 RUNNER_VENV_TEST_MODULES: Final = ("test_runner_venv.py",)

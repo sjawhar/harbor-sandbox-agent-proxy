@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from harbor_sandbox_agent_proxy.collaborators import DefaultUpstream, RequestDialect
+from harbor_sandbox_agent_proxy.collaborators import DefaultUpstream
 from harbor_sandbox_agent_proxy.relay import RelayCall, RelayPolicy, relay_methods
 
 

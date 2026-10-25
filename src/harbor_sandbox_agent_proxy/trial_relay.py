@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import hashlib
 from collections.abc import Collection, Mapping, Sequence
-from typing import Literal
 
-import pydantic
+import httpx
 
 from .collaborators import (
     BridgedMcpServer,
@@ -17,7 +18,14 @@ from .collaborators import (
     Upstream,
 )
 from .outcome import EventSink, RelayOutcome, TrialEvent, TrialIdentity
-from .relay import RelayCall, RelayPhase, RelayPolicy, mint_caller_key
+from .relay import (
+    GATEWAY_TIMEOUT,
+    RelayCall,
+    RelayPhase,
+    RelayPolicy,
+    mint_caller_key,
+    relay_methods,
+)
 
 _AGENT_ENVIRONMENT: Mapping[str, tuple[str, str]] = {
     "messages": ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
@@ -44,6 +52,15 @@ class TrialRelay:
     calls: list[RelayCall] = dataclasses.field(default_factory=list)
     events: list[TrialEvent] = dataclasses.field(default_factory=list)
     _closed: bool = False
+    environment: object | None = None
+    polling_interval: float | None = None
+    _proxy_task: asyncio.Task[None] | None = dataclasses.field(
+        default=None, init=False, repr=False
+    )
+    _proxy_stop: asyncio.Event | None = dataclasses.field(
+        default=None, init=False, repr=False
+    )
+
 
     def __post_init__(self) -> None:
         if self.secrets is None:
@@ -95,6 +112,13 @@ class TrialRelay:
         await self.sink.record(event)
 
     async def open_agent_phase(self) -> None:
+        if self._proxy_task is None and self.environment is not None:
+            ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._proxy_stop = asyncio.Event()
+            self._proxy_task = asyncio.create_task(
+                self._hold_proxy(ready, self._proxy_stop)
+            )
+            await ready
         await self._record_phase("agent-opened")
 
     async def end_agent_phase(self) -> None:
@@ -108,10 +132,14 @@ class TrialRelay:
         await self._record_phase("agent-resumed")
 
     async def close(self) -> RelayOutcome:
-        """Close the sink once and return a redaction-safe outcome."""
+        """Close the proxy and sink once, returning a redaction-safe outcome."""
         if self._closed:
             return self._outcome()
         self._closed = True
+        if self._proxy_stop is not None:
+            self._proxy_stop.set()
+        if self._proxy_task is not None:
+            await self._proxy_task
         await self._record_phase("closed")
         outcome = self._outcome()
         await self.sink.close(outcome)
@@ -158,6 +186,47 @@ class TrialRelay:
         event = TrialEvent(kind=kind, phase=self.phase, data={})
         self.events.append(event)
         await self.sink.record(event)
+    async def _hold_proxy(
+        self, ready: asyncio.Future[None], stop: asyncio.Event
+    ) -> None:
+        from .proxy import sandbox_model_proxy
+        from .sandbox_adapter import HarborSandboxEnvironment
+
+        if self.environment is None:
+            ready.set_result(None)
+            return
+        try:
+            sandbox = HarborSandboxEnvironment(
+                self.environment,
+                default_user="root",
+                polling_interval=self.polling_interval,
+            )
+            async with contextlib.AsyncExitStack() as stack:
+                client = await stack.enter_async_context(
+                    httpx.AsyncClient(timeout=GATEWAY_TIMEOUT)
+                )
+                proxy = await stack.enter_async_context(
+                    sandbox_model_proxy(
+                        sandbox,
+                        methods=relay_methods(
+                            self.current_policy,
+                            self.upstream,
+                            record=self.record,
+                            client=client,
+                        ),
+                        port=self.port,
+                        bridged_tools=[],
+                        polling_interval=self.polling_interval,
+                    )
+                )
+                self.port = proxy.port
+                ready.set_result(None)
+                await stop.wait()
+        except BaseException as error:
+            if not ready.done():
+                ready.set_exception(error)
+                return
+            raise
 
 
 class _EmptySecrets:
@@ -167,3 +236,4 @@ class _EmptySecrets:
 
 def _fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
