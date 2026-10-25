@@ -99,10 +99,12 @@ class TrialRelay:
     _proxy_stop: asyncio.Event | None = None
     _proxy_exit: dict[str, object] | None = None
     _bridged_tools: tuple[BridgedToolsSpec, ...] = ()
+    _caller_keys: set[str] = dataclasses.field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.port is None:
             self.port = self.config.port
+        self._caller_keys.update((self.agent_key, self.verifier_key))
         self._emit_key_minted("agent", self.agent_key)
         self._emit_key_minted("verifier", self.verifier_key)
 
@@ -114,7 +116,7 @@ class TrialRelay:
     def protected_values(self) -> frozenset[str]:
         """Expose redaction values in memory only; records never receive key values."""
         source = () if self.secrets is None else self.secrets.protected_values()
-        return frozenset({self.agent_key, self.verifier_key, *source})
+        return frozenset({*self._caller_keys, *source})
 
     def mcp_server_configs(self) -> list[harbor_task_config.MCPServerConfig]:
         """The loopback MCP endpoints an installed agent receives when it starts."""
@@ -175,6 +177,7 @@ class TrialRelay:
         """Swap credentials and select the conversation the verifier may inspect."""
         self.phase = "verifier"
         self.verifier_key = mint_caller_key()
+        self._caller_keys.add(self.verifier_key)
         await self._record_key_minted("verifier", self.verifier_key)
         selected = self._selector.selected
         if self._answered_agent_calls == 0 or selected is None:

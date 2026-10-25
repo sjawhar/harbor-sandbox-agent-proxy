@@ -153,20 +153,15 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         options = dict(kwargs or {})
         inner_config, inner_class = _inner_agent(options.get("agent"))
         _ = RelayConfig.model_validate(options.get("relay"))
-        if (
-            _calls_a_model(inner_class, inner_config)
-            and not issubclass(
+        if _calls_a_model(inner_class, inner_config):
+            if not issubclass(
                 inner_class, harbor_installed_agent_base.BaseInstalledAgent
-            )
-            and (
-                inner_class.options_model is None
-                or "api_base" not in inner_class.options_model.model_fields
-            )
-        ):
-            raise ValueError(
-                f"{inner_class.name()} names model {inner_config.model_name} but has no "
-                + "api_base option, so its host-side calls cannot be routed"
-            )
+            ):
+                runner_loop_api_base(
+                    inner_class,
+                    inner_config,
+                    _upstream(options.get("upstream")),
+                )
         inner_class.preflight(kwargs=inner_config.kwargs, env=env)
 
     @override
