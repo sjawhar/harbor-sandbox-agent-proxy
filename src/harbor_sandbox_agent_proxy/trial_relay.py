@@ -100,6 +100,7 @@ class TrialRelay:
     _proxy_exit: dict[str, object] | None = None
     _bridged_tools: tuple[BridgedToolsSpec, ...] = ()
     _caller_keys: set[str] = dataclasses.field(default_factory=set)
+    _initial_events_recorded: bool = False
 
     def __post_init__(self) -> None:
         if self.port is None:
@@ -157,6 +158,10 @@ class TrialRelay:
         """Start the proxy and hold its task-bound resources until ``close``."""
         if self._proxy_task is not None:
             raise RuntimeError("the trial relay is already open")
+        if not self._initial_events_recorded:
+            for event in self.events:
+                await self.sink.record(event)
+            self._initial_events_recorded = True
         if self.environment is None:
             await self._record_phase("agent-opened")
             return

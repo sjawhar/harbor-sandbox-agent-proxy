@@ -46,6 +46,9 @@ JSON kwargs. Each collaborator can be an object or a `module:attribute` import p
 - `EventSinkFactory` opens a per-trial record sink; and
 - `BridgedToolServerProvider` supplies per-trial MCP server specifications.
 
+Each `EventSink` receives the complete relay lifecycle. Caller-key events contain
+only one-way fingerprints, never the caller-key values themselves.
+
 Within one Harbor process, the wrapper agent, wrapper environment, and plugin find
 each other's per-trial state through trial-keyed registries. The environment removes
 its entry when it stops. Host integrations still own route policy and any
