@@ -245,12 +245,23 @@ def _refusals(harness: _Harness) -> list[TrialEvent]:
     return refusals
 
 
+_LIFECYCLE_KINDS = frozenset(
+    {"caller-key-minted", "agent-opened", "verifier-opened", "agent-resumed", "closed"}
+)
+
+
+def _non_lifecycle(events: Sequence[TrialEvent]) -> list[TrialEvent]:
+    """The events a test's actions caused: every event but the relay's own lifecycle."""
+    return [event for event in events if event.kind not in _LIFECYCLE_KINDS]
+
+
 async def test_a_claude_code_trials_granted_call_is_refused_outside_the_agents_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with _opened(monkeypatch, require_proposal=True) as harness:
         _grant(harness.bridge, _ARGUMENTS)
         await harness.relay.end_agent_phase()
+        before = list(harness.relay.events)
 
         with pytest.raises(inspect_ai.tool.ToolError) as refused:
             _ = await call_tool(harness.bridge)(_SERVER, _TOOL, dict(_ARGUMENTS))
@@ -263,9 +274,12 @@ async def test_a_claude_code_trials_granted_call_is_refused_outside_the_agents_t
         assert harness.failures == []
         assert harness.ran == []
         (event,) = _refusals(harness)
+        assert harness.relay.events == [*before, event]
         outcome = await harness.relay.close()
 
-    assert [recorded for recorded in outcome.events if recorded == event] == [event]
+    # hawk: `outcome.events == [event]`. The package also records its own lifecycle
+    # events (key minting, phase changes, close), so every other event must be one of those.
+    assert _non_lifecycle(outcome.events) == [event]
     assert outcome.counts == {
         "agent_calls": 0,
         "verifier_calls": 0,
@@ -279,11 +293,17 @@ async def test_a_codex_trials_bare_call_is_served_in_the_agents_turn_and_refused
 ) -> None:
     async with _opened(monkeypatch, require_proposal=False) as harness:
         call = call_tool(harness.bridge)
+        relay_before = list(harness.relay.events)
+        sink_before = list(harness.sink_events)
 
         assert await call(_SERVER, _TOOL, dict(_ARGUMENTS)) == "pong: hello"
         assert harness.ran == ["hello"]
-        assert harness.relay.events == harness.sink_events
-        assert not _refusals(harness)
+        # hawk: `harness.relay.events == []` and `harness.sink_events == []` after the
+        # served call: serving it records nothing, here beyond the lifecycle so far.
+        assert harness.relay.events == relay_before
+        assert harness.sink_events == sink_before
+        assert _non_lifecycle(harness.relay.events) == []
+        assert _non_lifecycle(harness.sink_events) == []
 
         await harness.relay.end_agent_phase()
         with pytest.raises(inspect_ai.tool.ToolError, match="relay phase: verifier"):
