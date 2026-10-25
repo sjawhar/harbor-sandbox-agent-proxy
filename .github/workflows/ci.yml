@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        harbor: ["0.23.0", "0.24.0"]
+        inspect: ["0.3.278", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --group dev
+          if [ "${{ matrix.inspect }}" = "latest" ]; then uv pip install --upgrade inspect-ai; else uv pip install "inspect-ai==${{ matrix.inspect }}"; fi
+          uv pip install "harbor==${{ matrix.harbor }}"
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run basedpyright
+      - run: uv run pytest -n 4 -q
+      - run: sudo "$(uv run which python)" -m pytest tests/test_environment.py -p no:cacheprovider -q

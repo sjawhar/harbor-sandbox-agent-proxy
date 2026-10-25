@@ -33,10 +33,10 @@ class RelayOutcome:
     """The redaction-safe terminal facts of a relay lifecycle."""
 
     trial: TrialIdentity
-    calls: tuple[Mapping[str, pydantic.JsonValue], ...]
+    calls: tuple[Mapping[str, object], ...]
     events: tuple[TrialEvent, ...]
     counts: Mapping[str, int]
-    conversation: Mapping[str, pydantic.JsonValue] | None
+    conversation: Mapping[str, object] | None
     refusal_reason: str | None
 
 
@@ -68,9 +68,9 @@ class JsonOutcomeSink:
     async def close(self, outcome: RelayOutcome) -> None:
         destination = self.trial.directory / "sandbox-agent-proxy" / "outcome.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, pydantic.JsonValue] = {
+        payload: dict[str, object] = {
             "trial": outcome.trial.name,
-            "calls": list(outcome.calls),
+            "calls": [dict(call) for call in outcome.calls],
             "events": [
                 {"kind": event.kind, "phase": event.phase, "data": dict(event.data)}
                 for event in outcome.events
@@ -85,7 +85,7 @@ class JsonOutcomeSink:
         )
 
 
-def _redact(value: pydantic.JsonValue, secrets: Collection[str]) -> pydantic.JsonValue:
+def _redact(value: object, secrets: Collection[str]) -> object:
     if isinstance(value, str):
         result = value
         for secret in secrets:

@@ -6,7 +6,7 @@ import dataclasses
 import enum
 import os
 from collections.abc import Collection, Mapping, Sequence
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from urllib.parse import quote
 
 
@@ -27,12 +27,14 @@ class UpstreamTarget:
     headers: Mapping[str, str]
 
 
+@runtime_checkable
 class Upstream(Protocol):
     """Resolve the destination for one model request."""
 
     async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget: ...
 
 
+@runtime_checkable
 class SecretSource(Protocol):
     """Values that must never be copied from host state into a sandbox."""
 

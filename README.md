@@ -23,10 +23,21 @@ uv add 'harbor-sandbox-agent-proxy[harbor,providers]'
 
 ## Job configuration
 
-Configure both wrappers with the same `relay` value. Each declared model's
-provider (or provider/service) needs a gateway route. The API key is read from the
-host process environment when a model call is made and is never passed to the
-sandbox.
+Configure both wrappers with the same `relay` value. The package's default
+`Upstream` resolves the public provider endpoint on every request and reads only the
+corresponding host environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+`GEMINI_API_KEY`). That value is never copied into the sandbox or the JSON outcome.
+
+Hosts that use another routing policy provide collaborators through the wrappers'
+JSON kwargs. Each collaborator can be an object or a `module:attribute` import path:
+
+- `upstream` implements `async resolve(*, dialect, model) -> UpstreamTarget`;
+- `secrets` returns host values that must be excluded and redacted;
+- `EventSinkFactory` opens a per-trial record sink; and
+- `BridgedToolServerProvider` supplies per-trial MCP server specifications.
+
+The package keeps no process-wide trial registry. A host integration owns its route
+policy and any transformation of the package's records into its own log format.
 
 ```json
 {
@@ -35,17 +46,9 @@ sandbox.
       "import_path": "harbor_sandbox_agent_proxy.agent:RelayAgent",
       "kwargs": {
         "agent": {"import_path": "my_package.agent:MyAgent"},
-        "relay": {
-          "declared_models": ["anthropic/claude-sonnet-4-5"],
-          "gateway": {
-            "routes": {
-              "anthropic": {
-                "base_url": "https://gateway.example/v1",
-                "api_key_env": "GATEWAY_API_KEY"
-              }
-            }
-          }
-        }
+        "relay": {"declared_models": ["anthropic/claude-sonnet-4-5"]},
+        "upstream": "my_package.routing:upstream",
+        "secrets": "my_package.routing:secrets"
       }
     }
   ],
@@ -53,17 +56,8 @@ sandbox.
     "import_path": "harbor_sandbox_agent_proxy.environment:RelayEnvironment",
     "kwargs": {
       "environment": {"import_path": "harbor.environments.docker.docker:DockerEnvironment"},
-      "relay": {
-        "declared_models": ["anthropic/claude-sonnet-4-5"],
-        "gateway": {
-          "routes": {
-            "anthropic": {
-              "base_url": "https://gateway.example/v1",
-              "api_key_env": "GATEWAY_API_KEY"
-            }
-          }
-        }
-      }
+      "relay": {"declared_models": ["anthropic/claude-sonnet-4-5"]},
+      "secrets": "my_package.routing:secrets"
     }
   },
   "metadata": {
@@ -73,6 +67,7 @@ sandbox.
   }
 }
 ```
+
 
 Run Harbor with the observer plugin:
 

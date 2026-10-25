@@ -58,7 +58,9 @@ class RelayPolicy:
     tools: Literal["any", "bridged-only"] = "any"
     permitted_tool_names: frozenset[str] = frozenset()
     permitted_tool_prefixes: tuple[str, ...] = ()
-    bridged: Mapping[str, frozenset[str]] = dataclasses.field(default_factory=dict)
+    bridged: Mapping[str, frozenset[str]] = dataclasses.field(
+        default_factory=lambda: {}
+    )
     allowed_betas: frozenset[str] | None = None
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES
     max_calls: int = DEFAULT_MAX_CALLS
@@ -242,7 +244,7 @@ def _headers(
         headers["anthropic-version"] = _header(incoming, "anthropic-version") or DEFAULT_ANTHROPIC_VERSION
         beta = _header(incoming, "anthropic-beta")
         if beta:
-            kept = []
+            kept: list[str] = []
             for item in (part.strip() for part in beta.split(",")):
                 if policy.allowed_betas is None or item in policy.allowed_betas:
                     kept.append(item)
@@ -274,17 +276,23 @@ def _json_object(value: pydantic.JsonValue) -> dict[str, pydantic.JsonValue]:
 
 def _gemini_body(value: pydantic.JsonValue) -> pydantic.JsonValue:
     if isinstance(value, str):
-        events = [line.removeprefix("data:").strip() for line in value.splitlines() if line.startswith("data:")]
+        events = [
+            line.removeprefix("data:").strip()
+            for line in value.splitlines()
+            if line.startswith("data:")
+        ]
         if events:
-            return json.loads(events[-1])
+            return pydantic.TypeAdapter(pydantic.JsonValue).validate_json(events[-1])
     return value
 
 
 def _upstream_message(method: str, status: int, body: pydantic.JsonValue) -> str:
-    if isinstance(body, dict) and isinstance(body.get("error"), dict):
-        message = body["error"].get("message")
-        if isinstance(message, str):
-            return f"{method}: upstream returned HTTP {status}: {message}"
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str):
+                return f"{method}: upstream returned HTTP {status}: {message}"
     return f"{method}: upstream returned HTTP {status}"
 
 
@@ -328,6 +336,7 @@ def _confine(
     body: dict[str, pydantic.JsonValue], dialect: RequestDialect, policy: RelayPolicy
 ) -> list[str]:
     """Remove provider-owned tools and account-file references from a request in place."""
+    del dialect
     stripped: list[str] = []
     tools = body.get("tools")
     if isinstance(tools, list):
@@ -362,14 +371,18 @@ def _tool_name(tool: Mapping[str, pydantic.JsonValue]) -> str | None:
     if isinstance(value, str):
         return value
     function = tool.get("function")
-    if isinstance(function, dict) and isinstance(function.get("name"), str):
-        return function["name"]
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str):
+            return name
     return None
 
 
-def _strip_file_references(value: pydantic.JsonValue, stripped: list[str]) -> pydantic.JsonValue:
+def _strip_file_references(
+    value: pydantic.JsonValue, stripped: list[str]
+) -> pydantic.JsonValue:
     if isinstance(value, list):
-        result = []
+        result: list[pydantic.JsonValue] = []
         for item in value:
             if isinstance(item, dict) and ("file_id" in item or "fileData" in item):
                 stripped.append("content:file")

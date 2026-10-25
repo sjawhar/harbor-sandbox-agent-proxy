@@ -1,0 +1,24 @@
+name: e2e
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        harbor: ["0.23.0", "0.24.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: |
+          uv sync --all-extras --group dev
+          uv pip install "harbor==${{ matrix.harbor }}"
+      - run: uv run pytest tests/e2e --e2e -m e2e -n 2 --durations=0
