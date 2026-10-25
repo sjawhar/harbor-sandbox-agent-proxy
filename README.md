@@ -16,7 +16,8 @@ works for a plain `harbor run`. The package depends on no particular host.
 
 The package supports `inspect-ai>=0.3.278`. It centralizes every private Inspect
 import in `_inspect_compat.py`; a moved private name raises an import error that
-names the incompatible symbol. It is tested with Inspect AI 0.3.278 and 0.3.285.
+names the incompatible symbol. It is tested with Inspect AI 0.3.278 and 0.3.285, and with
+Harbor 0.23.0 and 0.24.0.
 
 ## Status
 
