@@ -2,25 +2,36 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import enum
+import json
+import logging
 import os
 import shlex
-from collections.abc import Collection, Mapping, Sequence
+import tempfile
+from collections.abc import Collection, Generator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, override
+from typing import Any, Protocol, override, runtime_checkable
 
 import harbor.environments.base as harbor_environment_base
+import pydantic
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import EnvironmentCapabilities
-from harbor.models.task.config import EnvironmentConfig, TaskOS
+from harbor.models.task.config import (
+    EnvironmentConfig,
+    HealthcheckConfig,
+    NetworkPolicy,
+    TaskOS,
+)
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.utils.env import resolve_env_vars
 from harbor.utils.import_path import import_class
 
 from .collaborators import DefaultSecretSource, SecretSource
 from .registry import resolve_collaborator
-from .trial_relay import TrialRelay
+
+logger = logging.getLogger(__name__)
 
 _TESTS_STAGE_TEMPLATE = ".sandbox-agent-proxy-tests.XXXXXXXXXX"
 _TESTS_STAGE_PREFIX = _TESTS_STAGE_TEMPLATE.rstrip("X")
@@ -28,6 +39,62 @@ _TESTS_MIRROR_TEMPLATE = ".sandbox-agent-proxy-tests-mirror.XXXXXXXXXX"
 _TESTS_MIRROR_PREFIX = _TESTS_MIRROR_TEMPLATE.rstrip("X")
 _ROOT_UID = 0
 _REFUSED_EXIT = 3
+
+SANDBOX_CONVERSATION_PATH = PurePosixPath(
+    "/tests/sandbox-agent-proxy/conversation.json"
+)
+_CONVERSATION_IN_TESTS = SANDBOX_CONVERSATION_PATH.relative_to("/tests")
+
+MANAGED_PROVIDER_VARIABLES = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "VERTEX_API_KEY",
+        "GOOGLE_VERTEX_BASE_URL",
+    }
+)
+
+
+class SeparateVerifierEnvironmentError(RuntimeError):
+    """The relay needs Harbor's shared trial environment for verification."""
+
+
+class RunnerSecretExposureError(RuntimeError):
+    """A protected host value would be exposed to a Harbor trial."""
+
+
+SEPARATE_VERIFIER_UNSUPPORTED = (
+    "sandbox-agent-proxy does not support Harbor's separate verifier environment; "
+    + "run the task's verifier in the trial's own environment "
+    + "(verifier environment_mode 'shared')"
+)
+
+_MOUNTS = pydantic.TypeAdapter(list[dict[str, object]])
+
+
+def binds_trial_agent_dir(trial_paths: TrialPaths, mounts: object) -> bool:
+    """Whether Harbor mounted the trial agent directory into this environment."""
+    try:
+        entries = _MOUNTS.validate_python(mounts or [])
+    except pydantic.ValidationError:
+        return False
+    agent_dir = trial_paths.agent_dir.resolve()
+    return any(
+        isinstance(source := entry.get("source"), str)
+        and Path(source).resolve() == agent_dir
+        for entry in entries
+    )
 
 
 class _ExistingTests(enum.StrEnum):
@@ -245,13 +312,27 @@ def _made_mirror(output: str | None, tests_dir: PurePosixPath) -> PurePosixPath:
     return holder
 
 
+class _RelayPhase(Protocol):
+    @property
+    def verifier_conversation(self) -> object | None: ...
+
+    def phase_env(self) -> dict[str, str]: ...
+
+    async def close(self) -> object: ...
+
+
+@runtime_checkable
+class _RemoteExecutable(Protocol):
+    async def exec_remote(self, *args: object, **kwargs: object) -> object: ...
+
+
 class RelayEnvironment(BaseEnvironment):
     """Delegate lifecycle operations, confine secrets, and lock verifier tests."""
 
     _inner: BaseEnvironment
     _secrets: SecretSource
+    _configured_environments: tuple[tuple[str, Mapping[str, str]], ...]
     _tests_mirror: _TestsMirror | None
-    relay: TrialRelay | None
 
     def __init__(
         self,
@@ -266,6 +347,10 @@ class RelayEnvironment(BaseEnvironment):
         secrets: object | None = None,
         **kwargs: Any,
     ) -> None:
+        if "mounts" in kwargs and not binds_trial_agent_dir(
+            trial_paths, kwargs["mounts"]
+        ):
+            raise SeparateVerifierEnvironmentError(SEPARATE_VERIFIER_UNSUPPORTED)
         del relay
         source = (
             DefaultSecretSource(os.environ)
@@ -291,6 +376,10 @@ class RelayEnvironment(BaseEnvironment):
             confined_kwargs["persistent_env"] = _without_protected(
                 persistent_env, protected
             )
+        self._configured_environments = (
+            ("the task environment", resolved_task_env),
+            ("the persistent environment", persistent_env or {}),
+        )
 
         raw_path = environment.get("import_path")
         if not isinstance(raw_path, str):
@@ -345,19 +434,25 @@ class RelayEnvironment(BaseEnvironment):
     def default_user(self, value: str | int | None) -> None:
         self._inner.default_user = value
 
-    def attach_relay(self, relay: TrialRelay) -> None:
+    def attach_relay(self, relay: _RelayPhase) -> None:
         self.relay = relay
-        self._secrets = _RelaySecrets(relay)
+        ENVIRONMENTS[self.trial_paths.trial_dir.name] = self
 
     def _validate_definition(self) -> None:
         self._inner._validate_definition()
 
     @override
     def _startup_env(self) -> dict[str, str]:
-        return self._confined(self._inner._startup_env()) or {}
+        startup_env = self._inner._startup_env()
+        self._refuse_protected(startup_env, where="the sandbox's startup environment")
+        return (
+            self._confined(startup_env, where="the sandbox's startup environment") or {}
+        )
 
     @override
     async def start(self, force_build: bool) -> None:
+        self._refuse_configured_protected()
+        _ = self._startup_env()
         self._tests_mirror = None
         await self._inner.start(force_build)
         try:
@@ -375,12 +470,11 @@ class RelayEnvironment(BaseEnvironment):
             raise RuntimeError(
                 "Could not inspect the started sandbox environment for protected values"
             )
-        protected = self._secrets.protected_values()
         for assignment in (result.stdout or "").splitlines():
             name, separator, value = assignment.partition("=")
-            if separator and any(secret and secret in value for secret in protected):
-                raise RuntimeError(
-                    "Started sandbox environment contains a protected value in " + name
+            if separator:
+                self._refuse_protected(
+                    {name: value}, where="the started sandbox environment"
                 )
 
     async def _stop_after_failed_start(self, error: BaseException) -> None:
@@ -394,6 +488,7 @@ class RelayEnvironment(BaseEnvironment):
 
     @override
     async def stop(self, delete: bool) -> None:
+        ENVIRONMENTS.pop(self.trial_paths.trial_dir.name, None)
         relay, self.relay = self.relay, None
         self._tests_mirror = None
         if relay is not None:
@@ -421,6 +516,7 @@ class RelayEnvironment(BaseEnvironment):
         stage, existing = await self._stage_tests(tests_dir, owner, mirror)
         try:
             await self._inner.upload_dir(source_dir, str(stage / tests_dir.name))
+            await self._write_conversation(stage / tests_dir.name)
             result = await self._exec_as_root(
                 _move_tests_in_script(
                     tests_dir,
@@ -441,6 +537,44 @@ class RelayEnvironment(BaseEnvironment):
             await self._discard_stage(stage, error)
             raise
         self._tests_mirror = _TestsMirror(holder=holder)
+        if existing is not _ExistingTests.DISCARDED:
+            return
+        if mirror is None:
+            logger.warning(
+                "Replaced %s, whose files a user other than root could have written, "
+                + "with the verifier's tests; what it held was discarded unread",
+                tests_dir,
+            )
+        else:
+            logger.warning(
+                "Replaced %s, which held files again after Harbor emptied it, with "
+                + "the verifier's tests; what it held was discarded unread",
+                tests_dir,
+            )
+
+    async def _write_conversation(self, staged: PurePosixPath) -> None:
+        relay = self.relay
+        conversation = (
+            None if relay is None else getattr(relay, "verifier_conversation", None)
+        )
+        if conversation is None:
+            return
+        target = staged / _CONVERSATION_IN_TESTS
+        _ = await self._exec_as_root(
+            f"umask 077 && mkdir -p {shlex.quote(str(target.parent))}",
+            what=f"make {target.parent}",
+        )
+        conversation_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".json", delete=False
+            ) as conversation_file:
+                json.dump(conversation, conversation_file)
+                conversation_path = Path(conversation_file.name)
+            await self._inner.upload_file(conversation_path, str(target))
+        finally:
+            if conversation_path is not None:
+                conversation_path.unlink(missing_ok=True)
 
     async def _stage_tests(
         self,
@@ -502,6 +636,126 @@ class RelayEnvironment(BaseEnvironment):
         await self._inner.download_dir(source_dir, target_dir)
 
     @override
+    async def download_dir_filtered(
+        self,
+        *,
+        source_dir: str,
+        target_dir: Path | str,
+        include: Sequence[str] | None = None,
+        exclude: Sequence[str] | None = None,
+        protect: Sequence[str] | None = None,
+    ) -> None:
+        await self._inner.download_dir_filtered(
+            source_dir=source_dir,
+            target_dir=target_dir,
+            include=include,
+            exclude=exclude,
+            protect=protect,
+        )
+
+    @override
+    @contextlib.contextmanager
+    def scoped_output_callback(
+        self, callback: harbor_environment_base.OutputCallback | None
+    ) -> Generator[None, None, None]:
+        with super().scoped_output_callback(callback):
+            with self._inner.scoped_output_callback(callback):
+                yield
+
+    @override
+    async def service_exec(
+        self,
+        command: str,
+        *,
+        service: str | None = None,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        return await self._inner.service_exec(
+            command,
+            service=service,
+            cwd=cwd,
+            env=self._confined(env, where="a service exec environment"),
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+    @override
+    async def service_download_file(
+        self,
+        source_path: str,
+        target_path: Path | str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        await self._inner.service_download_file(
+            source_path, target_path, service=service
+        )
+
+    @override
+    async def service_download_dir(
+        self,
+        source_dir: str,
+        target_dir: Path | str,
+        *,
+        service: str | None = None,
+    ) -> None:
+        await self._inner.service_download_dir(source_dir, target_dir, service=service)
+
+    @override
+    async def service_download_dir_with_exclusions(
+        self,
+        *,
+        source_dir: str,
+        target_dir: Path | str,
+        exclude: list[str],
+        service: str | None = None,
+    ) -> None:
+        await self._inner.service_download_dir_with_exclusions(
+            source_dir=source_dir,
+            target_dir=target_dir,
+            exclude=exclude,
+            service=service,
+        )
+
+    @override
+    async def service_is_dir(
+        self,
+        path: str,
+        *,
+        service: str | None = None,
+        user: str | int | None = None,
+    ) -> bool:
+        return await self._inner.service_is_dir(path, service=service, user=user)
+
+    async def exec_remote(self, *args: object, **kwargs: object) -> object:
+        if not isinstance(self._inner, _RemoteExecutable):
+            raise AttributeError(
+                f"{self._inner.type()} does not expose an exec_remote operation."
+            )
+        return await self._inner.exec_remote(*args, **kwargs)
+
+    @override
+    async def run_healthcheck(
+        self, healthcheck: HealthcheckConfig | None = None
+    ) -> None:
+        await self._inner.run_healthcheck(healthcheck)
+
+    @override
+    async def set_network_policy(self, network_policy: NetworkPolicy) -> None:
+        await self._inner.set_network_policy(network_policy)
+
+    @override
+    async def stop_service(self, service: str) -> None:
+        await self._inner.stop_service(service)
+
+    @override
+    async def prepare_logs_for_host(self) -> None:
+        await self._inner.prepare_logs_for_host()
+
+    @override
     async def empty_dirs(
         self,
         dirs: Sequence[harbor_environment_base.EnvironmentPath],
@@ -528,32 +782,46 @@ class RelayEnvironment(BaseEnvironment):
         return await self._inner.exec(
             command,
             cwd=cwd,
-            env=self._confined(env),
+            env=self._confined(env, where="an exec environment"),
             timeout_sec=timeout_sec,
             user=user,
         )
 
-    def _confined(self, env: dict[str, str] | None) -> dict[str, str] | None:
+    def _refuse_configured_protected(self) -> None:
+        for where, environment in self._configured_environments:
+            self._refuse_protected(environment, where=where)
+
+    def _refuse_protected(
+        self, environment: Mapping[str, str] | None, *, where: str
+    ) -> None:
+        if not environment:
+            return
+        protected = self._secrets.protected_values()
+        exposed = sorted(
+            name
+            for name, value in environment.items()
+            if any(secret and secret in value for secret in protected)
+        )
+        if exposed:
+            raise RunnerSecretExposureError(
+                f"{where} carries a protected value under {', '.join(exposed)}; "
+                + "protected values never enter a Harbor trial"
+            )
+
+    def _confined(
+        self, env: dict[str, str] | None, *, where: str
+    ) -> dict[str, str] | None:
         merged = self._merge_env(env) or {}
-        confined = _without_protected(merged, self._secrets.protected_values())
         if self.relay is not None:
-            for name in (
-                "ANTHROPIC_API_KEY",
-                "ANTHROPIC_BASE_URL",
-                "OPENAI_API_KEY",
-                "OPENAI_BASE_URL",
-                "GOOGLE_API_KEY",
-                "GOOGLE_GEMINI_BASE_URL",
-                "GEMINI_API_KEY",
-            ):
-                confined.pop(name, None)
-            confined.update(self.relay.phase_env())
-        return confined or None
+            merged = {
+                name: value
+                for name, value in merged.items()
+                if name not in MANAGED_PROVIDER_VARIABLES
+            }
+        self._refuse_protected(merged, where=where)
+        if self.relay is not None:
+            merged.update(self.relay.phase_env())
+        return merged or None
 
 
-class _RelaySecrets:
-    def __init__(self, relay: TrialRelay) -> None:
-        self._relay = relay
-
-    def protected_values(self) -> Collection[str]:
-        return self._relay.protected_values()
+ENVIRONMENTS: dict[str, RelayEnvironment] = {}

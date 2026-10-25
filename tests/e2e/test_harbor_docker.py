@@ -212,10 +212,7 @@ schema_version = "1.4"
 
 [agent]
 user = 1000
-
-[environment.env]
-OPENAI_API_KEY = "${OPENAI_API_KEY}"
-        """,
+""",
         encoding="utf-8",
     )
     (tests / "test.sh").write_text(
@@ -476,6 +473,6 @@ def test_docker_compose_host_environment_reference_is_refused(tmp_path: Path) ->
     assert result.returncode == 0, output
     [trial_result] = (tmp_path / "jobs").glob("**/task__*/result.json")
     exception = json.loads(trial_result.read_text(encoding="utf-8"))["exception_info"]
-    assert exception["exception_type"] == "RuntimeError"
+    assert exception["exception_type"] == "RunnerSecretExposureError"
     assert "OPENAI_API_KEY" in exception["exception_message"]
     assert HOST_KEY not in exception["exception_message"]
