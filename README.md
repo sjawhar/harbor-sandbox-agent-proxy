@@ -1,24 +1,36 @@
 # harbor-sandbox-agent-proxy
 
-`harbor-sandbox-agent-proxy` is a public [Harbor](https://github.com/METR/harbor)
-extension for running an agent inside a Harbor sandbox while relaying its model calls
-through a host-side gateway. It provides:
+`harbor-sandbox-agent-proxy` is a public [Harbor](https://github.com/harbor-framework/harbor)
+extension for running an agent inside a Harbor sandbox with no model API key in the
+sandbox: the agent's model calls are relayed through a host-side process that holds
+the key. It provides:
 
 - `RelayAgent` and `RelayEnvironment` import-path wrappers for a Harbor job;
-- a sandbox-side model proxy that uses Inspect AI's existing bridge interfaces;
+- a sandbox-side model proxy that uses Inspect AI's existing bridge interfaces; and
 - a `sandbox-agent-proxy` Harbor observer plugin, which records a redacted
-  per-trial outcome at `sandbox-agent-proxy/outcome.json`; and
-- reusable Docker e2e fixtures for Messages- and Responses-dialect agents.
+  per-trial outcome at `sandbox-agent-proxy/outcome.json`.
+
+Everything a host decides (where calls go, which key they use, where per-call records
+are written, which values are secret) is an injected collaborator with a default that
+works for a plain `harbor run`. The package depends on no particular host.
 
 The package supports `inspect-ai>=0.3.278`. It centralizes every private Inspect
 import in `_inspect_compat.py`; a moved private name raises an import error that
-names the incompatible symbol. Version 0.1.0 is tested with Inspect AI 0.3.278
-through 0.3.285.
+names the incompatible symbol. It is tested with Inspect AI 0.3.278 and 0.3.285.
+
+## Status
+
+Pre-release. Not yet on PyPI. Not yet a complete security control:
+
+- The verifier's tests tree is not yet locked from the agent.
+- The Docker e2e runs a stock `harbor run` through the wrappers and the plugin, but its
+  agent makes no model call yet, so relaying a Messages- or Responses-dialect call
+  end to end is not yet proven in Docker (it is unit-tested).
 
 ## Install
 
 ```bash
-uv add 'harbor-sandbox-agent-proxy[harbor,providers]'
+uv add 'harbor-sandbox-agent-proxy[harbor,providers] @ git+https://github.com/sjawhar/harbor-sandbox-agent-proxy'
 ```
 
 ## Job configuration
@@ -76,7 +88,7 @@ harbor run --config job.json --yes --plugin sandbox-agent-proxy
 ```
 
 The included e2e suite drives this command against Harbor's Docker environment and
-checks the recorded outcome and verifier results.
+checks the recorded outcome.
 
 ## Development
 
