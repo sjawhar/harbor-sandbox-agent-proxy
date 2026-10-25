@@ -3,20 +3,243 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Collection
-from pathlib import Path
+import shlex
+from collections.abc import Collection, Mapping, Sequence
+from pathlib import Path, PurePosixPath
 from typing import Any, override
 
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import EnvironmentCapabilities
 from harbor.models.task.config import EnvironmentConfig, TaskOS
-from harbor.models.trial.paths import TrialPaths
+from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
+from harbor.utils.env import resolve_env_vars
 from harbor.utils.import_path import import_class
 
 from .collaborators import DefaultSecretSource, SecretSource
 from .registry import resolve_collaborator
 from .trial_relay import TrialRelay
 
+_TESTS_STAGE_TEMPLATE = ".sandbox-agent-proxy-tests.XXXXXXXXXX"
+_TESTS_STAGE_PREFIX = _TESTS_STAGE_TEMPLATE.rstrip("X")
+_TESTS_MIRROR_TEMPLATE = ".sandbox-agent-proxy-tests-mirror.XXXXXXXXXX"
+_TESTS_MIRROR_PREFIX = _TESTS_MIRROR_TEMPLATE.rstrip("X")
+_ROOT_UID = 0
+_REFUSED_EXIT = 3
+
+
+class _ExistingTests(enum.StrEnum):
+    ABSENT = "absent"
+    COPIED = "copied"
+    SUPERSEDED = "superseded"
+    DISCARDED = "discarded"
+
+
+@dataclasses.dataclass(frozen=True)
+class _TestsMirror:
+    """The wrapper-owned root-only copy of its last installed tests tree."""
+
+    holder: PurePosixPath
+    emptied: bool = False
+
+
+def _uid_of(user: str | int) -> str:
+    text = str(user)
+    if text == "root":
+        return "0"
+    if text.isdigit():
+        return text
+    return f"$(id -u {shlex.quote(text)})"
+
+
+def _resolved_env(value: object, *, label: str) -> dict[str, str] | None:
+    """Resolve one Harbor environment mapping before it reaches an inner backend."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+        isinstance(name, str) and isinstance(entry, str)
+        for name, entry in value.items()
+    ):
+        raise TypeError(f"{label} must be a dict[str, str]")
+    return resolve_env_vars(value)
+
+
+def _without_protected(
+    environment: Mapping[str, str], protected: Collection[str]
+) -> dict[str, str]:
+    """Remove values that contain a host value the secret collaborator protects."""
+    return {
+        name: value
+        for name, value in environment.items()
+        if not any(secret and secret in value for secret in protected)
+    }
+
+
+def _mirror_check(
+    holder: PurePosixPath, *, copy: PurePosixPath | None = None
+) -> tuple[str, ...]:
+    quoted = shlex.quote(str(holder))
+    copy_check = ""
+    if copy is not None:
+        copied = shlex.quote(str(copy))
+        copy_check = f" \\\n+  || [ -L {copied} ] || [ ! -d {copied} ]"
+    return (
+        f"if [ -L {quoted} ] || [ ! -d {quoted} ] \\",
+        f'  || [ "$(stat -c %u {quoted})" != "$stager_uid" ] \\',
+        f'  || [ "$(stat -c %a {quoted})" != 700 ]{copy_check}; then',
+        "  echo 'tests mirror is not the directory only root can enter' >&2",
+        f"  exit {_REFUSED_EXIT}",
+        "fi",
+    )
+
+
+def _held_files(tests: str) -> tuple[str, ...]:
+    return (
+        f"  held=$(find -P {tests} -mindepth 1 -print -quit) || fail",
+        '  if [ -n "$held" ]; then',
+        f"    existing={_ExistingTests.DISCARDED}",
+        "  else",
+        f"    existing={_ExistingTests.SUPERSEDED}",
+        "  fi",
+    )
+
+
+def _stage_tests_script(
+    tests_dir: PurePosixPath, owner: str | int, mirror: _TestsMirror | None
+) -> str:
+    """Create a root-only stage beside ``tests_dir`` and print its path and state."""
+    tests = shlex.quote(str(tests_dir))
+    parent = shlex.quote(str(tests_dir.parent))
+    staged = f'"$stage"/{shlex.quote(tests_dir.name)}'
+    check_copy: tuple[str, ...] = ()
+    build_on_copy: tuple[str, ...] = ()
+    if mirror is None:
+        untrusted = (
+            f"find -P {tests} \\( \\( -type l ! -user {_ROOT_UID} \\) -o \\( ! -type l"
+            + f" \\( ! -user {_ROOT_UID} -o -perm /022 \\) \\) \\) -print -quit"
+        )
+        existing: tuple[str, ...] = (
+            f"  untrusted=$({untrusted}) || fail",
+            '  if [ -z "$untrusted" ]; then',
+            f"    cp -a {tests}/. {staged}/ || fail",
+            f"    existing={_ExistingTests.COPIED}",
+            "  else",
+            *(f"  {line}" for line in _held_files(tests)),
+            "  fi",
+        )
+    elif mirror.emptied:
+        existing = _held_files(tests)
+    else:
+        existing = (f"  existing={_ExistingTests.SUPERSEDED}",)
+        copy = mirror.holder / tests_dir.name
+        check_copy = _mirror_check(mirror.holder, copy=copy)
+        build_on_copy = (f"cp -a {shlex.quote(str(copy))}/. {staged}/ || fail",)
+    return "\n".join(
+        (
+            "umask 077",
+            f"owner_uid={_uid_of(owner)} || exit 1",
+            "stager_uid=$(id -u) || exit 1",
+            f"parent_uid=$(stat -c %u {parent}) && parent_mode=$(stat -c %a {parent})"
+            + " || exit 1",
+            'if { [ "$parent_uid" != 0 ] && [ "$parent_uid" != "$owner_uid" ] \\',
+            '  && [ "$parent_uid" != "$stager_uid" ]; } \\',
+            "  || [ $((0$parent_mode & 022)) -ne 0 ]; then",
+            "  printf '%s is owned by uid %s with mode %s; users other than root "
+            + f'could rename a stage there\\n\' {parent} "$parent_uid" "$parent_mode" >&2',
+            f"  exit {_REFUSED_EXIT}",
+            "fi",
+            *check_copy,
+            "stage=$(mktemp -d "
+            + shlex.quote(str(tests_dir.parent / _TESTS_STAGE_TEMPLATE))
+            + ") || exit 1",
+            'fail() { rm -rf -- "$stage"; exit 1; }',
+            "refuse() {",
+            '  rm -rf -- "$stage"',
+            f'  printf "%s %s; verifier tests are not put there\\n" {tests} "$1" >&2',
+            f"  exit {_REFUSED_EXIT}",
+            "}",
+            f"if [ -L {tests} ]; then",
+            f'  refuse "is a symbolic link to $(readlink {tests})"',
+            f"elif [ -e {tests} ] && [ ! -d {tests} ]; then",
+            '  refuse "is not a directory"',
+            "fi",
+            f"mkdir {staged} || fail",
+            f"existing={_ExistingTests.ABSENT}",
+            f"if [ -d {tests} ]; then",
+            *existing,
+            "fi",
+            *build_on_copy,
+            'printf "%s\\n%s\\n" "$stage" "$existing"',
+        )
+    )
+
+
+def _move_tests_in_script(
+    tests_dir: PurePosixPath,
+    stage: PurePosixPath,
+    owner: str | int,
+    existing: _ExistingTests,
+    holder: PurePosixPath | None,
+) -> str:
+    """Lock staged tests, make a root-only copy, then atomically move them in place."""
+    tests = shlex.quote(str(tests_dir))
+    staged = shlex.quote(str(stage / tests_dir.name))
+    copy = shlex.quote(str(stage / "mirror"))
+    if existing is _ExistingTests.ABSENT:
+        clear: tuple[str, ...] = (
+            f"if [ -e {tests} ] || [ -L {tests} ]; then",
+            f"  echo '{tests_dir} appeared while verifier tests were staged' >&2",
+            f"  exit {_REFUSED_EXIT}",
+            "fi",
+        )
+    else:
+        clear = (
+            f"if [ -L {tests} ] || [ ! -d {tests} ]; then",
+            f"  echo '{tests_dir} changed while verifier tests were staged' >&2",
+            f"  exit {_REFUSED_EXIT}",
+            "fi",
+            f"mv -T {tests} {shlex.quote(str(stage / 'previous'))} || exit 1",
+        )
+    if holder is None:
+        check: tuple[str, ...] = ()
+        keep: tuple[str, ...] = (
+            "mirror=$(mktemp -d "
+            + shlex.quote(str(tests_dir.parent / _TESTS_MIRROR_TEMPLATE))
+            + ") || exit 1",
+            f'mv -T {copy} "$mirror"/{shlex.quote(tests_dir.name)}'
+            + ' || { rm -rf -- "$mirror"; exit 1; }',
+            'printf "%s\\n" "$mirror"',
+        )
+    else:
+        kept = shlex.quote(str(holder / tests_dir.name))
+        check = ("stager_uid=$(id -u) || exit 1", *_mirror_check(holder))
+        keep = (f"rm -rf -- {kept} || exit 1", f"mv -T {copy} {kept} || exit 1")
+    return "\n".join(
+        (
+            *check,
+            f"chown -R {shlex.quote(str(owner))} {staged} || exit 1",
+            f"chmod -R u=rwX,go= {staged} || exit 1",
+            f"cp -a {staged} {copy} || exit 1",
+            *clear,
+            f"mv -T {staged} {tests} || exit 1",
+            *keep,
+            f"rm -rf -- {shlex.quote(str(stage))}",
+        )
+    )
+
+
+def _made_mirror(output: str | None, tests_dir: PurePosixPath) -> PurePosixPath:
+    lines = (output or "").strip().splitlines()
+    holder = PurePosixPath(lines[-1].strip()) if lines else None
+    if (
+        holder is None
+        or holder.parent != tests_dir.parent
+        or not holder.name.startswith(_TESTS_MIRROR_PREFIX)
+    ):
+        raise RuntimeError(
+            "Installing verifier tests printed no root-only mirror directory: "
+            + repr(output)
+        )
+    return holder
 
 class RelayEnvironment(BaseEnvironment):
     _inner: BaseEnvironment
@@ -39,6 +262,31 @@ class RelayEnvironment(BaseEnvironment):
         **kwargs: Any,
     ) -> None:
         del relay
+        source = (
+            DefaultSecretSource(os.environ)
+            if secrets is None
+            else resolve_collaborator(secrets, label="secrets")
+        )
+        if not isinstance(source, SecretSource):
+            raise TypeError("secrets must implement protected_values")
+        self._secrets = source
+        protected = source.protected_values()
+        resolved_task_env = (
+            resolve_env_vars(task_env_config.env) if task_env_config.env else {}
+        )
+        confined_task_env = _without_protected(resolved_task_env, protected)
+        confined_task_config = task_env_config.model_copy(
+            update={"env": confined_task_env}
+        )
+        confined_kwargs = dict(kwargs)
+        persistent_env = _resolved_env(
+            confined_kwargs.get("persistent_env"), label="persistent_env"
+        )
+        if persistent_env is not None:
+            confined_kwargs["persistent_env"] = _without_protected(
+                persistent_env, protected
+            )
+
         raw_path = environment.get("import_path")
         if not isinstance(raw_path, str):
             raise ValueError("environment requires an import_path")
@@ -51,26 +299,19 @@ class RelayEnvironment(BaseEnvironment):
             environment_name=environment_name,
             session_id=session_id,
             trial_paths=trial_paths,
-            task_env_config=task_env_config,
+            task_env_config=confined_task_config,
             **raw_kwargs,
-            **kwargs,
+            **confined_kwargs,
         )
-        source = (
-            DefaultSecretSource(os.environ)
-            if secrets is None
-            else resolve_collaborator(secrets, label="secrets")
-        )
-        if not isinstance(source, SecretSource):
-            raise TypeError("secrets must implement protected_values")
-        self._secrets = source
+        self._tests_mirror = None
         self.relay = None
         super().__init__(
             environment_dir,
             environment_name,
             session_id,
             trial_paths,
-            task_env_config,
-            **kwargs,
+            confined_task_config,
+            **confined_kwargs,
         )
 
     @staticmethod
@@ -100,7 +341,39 @@ class RelayEnvironment(BaseEnvironment):
         return self._confined(self._inner._startup_env()) or {}
 
     async def start(self, force_build: bool) -> None:
+        self._tests_mirror = None
         await self._inner.start(force_build)
+        try:
+            await self._assert_started_sandbox_is_confined()
+        except BaseException as error:
+            await self._stop_after_failed_start(error)
+            raise
+
+    async def _assert_started_sandbox_is_confined(self) -> None:
+        result = await self._inner.exec(
+            "tr '\\000' '\\n' </proc/1/environ; env",
+            user="root",
+        )
+        if result.return_code != 0:
+            raise RuntimeError(
+                "Could not inspect the started sandbox environment for protected values"
+            )
+        protected = self._secrets.protected_values()
+        for assignment in (result.stdout or "").splitlines():
+            name, separator, value = assignment.partition("=")
+            if separator and any(secret and secret in value for secret in protected):
+                raise RuntimeError(
+                    "Started sandbox environment contains a protected value in " + name
+                )
+
+    async def _stop_after_failed_start(self, error: BaseException) -> None:
+        try:
+            await self._inner.stop(delete=True)
+        except Exception as cleanup_error:  # noqa: BLE001
+            error.add_note(
+                "Stopping the environment after its confinement check failed also failed: "
+                + repr(cleanup_error)
+            )
 
     async def stop(self, delete: bool) -> None:
         relay, self.relay = self.relay, None
@@ -140,12 +413,7 @@ class RelayEnvironment(BaseEnvironment):
 
     def _confined(self, env: dict[str, str] | None) -> dict[str, str] | None:
         merged = self._merge_env(env) or {}
-        protected = self._secrets.protected_values()
-        confined = {
-            name: value
-            for name, value in merged.items()
-            if not any(secret and secret in value for secret in protected)
-        }
+        confined = _without_protected(merged, self._secrets.protected_values())
         if self.relay is not None:
             for name in (
                 "ANTHROPIC_API_KEY",
