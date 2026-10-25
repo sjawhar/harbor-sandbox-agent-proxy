@@ -7,21 +7,27 @@ import pathlib
 import shlex
 import tempfile
 import uuid
-from typing import Literal, Protocol, overload, override
+from typing import TYPE_CHECKING, Final, Literal, Protocol, overload, override
 
 import inspect_ai.util
 
-STDERR_BOUNDARY = "\x1e\x1e__INSPECT_HARBOR_ADAPTER_STDERR_BOUNDARY__\x1e\x1e"
-_SPLIT_SCRIPT = (
+if TYPE_CHECKING:
+    from inspect_ai.util import SandboxEnvironment, SandboxEnvironmentConfigType
+
+STDERR_BOUNDARY: Final = "\x1e\x1e__INSPECT_HARBOR_ADAPTER_STDERR_BOUNDARY__\x1e\x1e"
+_SPLIT_SCRIPT: Final = (
     "__o=$(mktemp); __e=$(mktemp); "
     + 'eval "$1" >"$__o" 2>"$__e"; __rc=$?; '
     + 'cat "$__o"; printf %s "'
     + STDERR_BOUNDARY
-    + '"; cat "$__e"; rm -f "$__o" "$__e"; exit $__rc'
+    + '"; cat "$__e"; '
+    + 'rm -f "$__o" "$__e"; exit $__rc'
 )
-_MAX_ARG_STRLEN = 131072
-INLINE_STDIN_LIMIT = (_MAX_ARG_STRLEN - 32 * 1024) // 4 * 3
-_FILE_TRANSFER_USER = "root"
+_MAX_ARG_STRLEN: Final = 131072
+_INLINE_STDIN_ENCODED_LIMIT: Final = _MAX_ARG_STRLEN - 32 * 1024
+INLINE_STDIN_LIMIT: Final = _INLINE_STDIN_ENCODED_LIMIT // 4 * 3
+_TIMEOUT_EXIT_CODE: Final = 124
+_FILE_TRANSFER_USER: Final = "root"
 
 
 class HarborExecResult(Protocol):
@@ -54,6 +60,11 @@ class HarborEnvironment(Protocol):
     ) -> None: ...
 
 
+def _is_not_found(error: Exception) -> bool:
+    """Recognize a provider-specific missing-file error without its optional SDK."""
+    return "NotFound" in type(error).__name__
+
+
 class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
     """Use an already-running Harbor environment as an Inspect sandbox."""
 
@@ -65,9 +76,9 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
         polling_interval: float | None = None,
     ) -> None:
         super().__init__()
-        self._environment = environment
-        self._default_user = default_user
-        self._polling_interval = polling_interval
+        self._environment: HarborEnvironment = environment
+        self._default_user: str | None = default_user
+        self._polling_interval: float | None = polling_interval
 
     @override
     async def exec(
@@ -82,44 +93,55 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
         concurrency: bool = True,
     ) -> inspect_ai.util.ExecResult[str]:
         del timeout_retry, concurrency
-        command = shlex.join(cmd)
-        staged: str | None = None
+        inner = shlex.join(cmd)
+        staged_stdin: str | None = None
         if input is not None:
-            data = input.encode() if isinstance(input, str) else input
+            data = input.encode("utf-8") if isinstance(input, str) else input
             if len(data) <= INLINE_STDIN_LIMIT:
                 encoded = base64.b64encode(data).decode("ascii")
-                command = f"printf '%s' {shlex.quote(encoded)} | base64 -d | {command}"
+                inner = f"printf '%s' {shlex.quote(encoded)} | base64 -d | {inner}"
             else:
-                staged = f"/tmp/.inspect-stdin-{uuid.uuid4().hex}"
-                await self._upload_bytes(data, staged)
-                command = f"{command} < {shlex.quote(staged)}"
-        wrapped = f"sh -c {shlex.quote(_SPLIT_SCRIPT)} sh {shlex.quote(command)}"
-        failure: BaseException | None = None
+                staged_stdin = f"/tmp/.inspect-stdin-{uuid.uuid4().hex}"
+                await self._upload_bytes(data, staged_stdin)
+                inner = f"{inner} < {shlex.quote(staged_stdin)}"
+        wrapped = f"sh -c {shlex.quote(_SPLIT_SCRIPT)} sh {shlex.quote(inner)}"
+        command_error: BaseException | None = None
         try:
             result = await self._environment.exec(
-                wrapped,
+                command=wrapped,
                 cwd=cwd,
                 env=env,
                 timeout_sec=timeout,
                 user=user if user is not None else self._default_user,
             )
+        except RuntimeError as error:
+            if (
+                timeout is not None
+                and type(error) is RuntimeError
+                and "timed out" in str(error)
+            ):
+                command_error = TimeoutError(str(error))
+                raise command_error from error
+            command_error = error
+            raise
         except BaseException as error:
-            failure = error
+            command_error = error
             raise
         finally:
-            if staged is not None:
-                await self._remove_staged(staged, failure)
+            if staged_stdin is not None:
+                await self._remove_staged_stdin(staged_stdin, command_error)
         merged = result.stdout or ""
         if STDERR_BOUNDARY in merged:
             stdout, _, stderr = merged.partition(STDERR_BOUNDARY)
-            stderr += result.stderr or ""
+            if result.stderr:
+                stderr += result.stderr
         else:
-            if timeout is not None and result.return_code == 124:
+            if timeout is not None and result.return_code == _TIMEOUT_EXIT_CODE:
                 raise TimeoutError(
                     result.stderr or f"Command timed out after {timeout} seconds"
                 )
             stdout, stderr = merged, result.stderr or ""
-        return inspect_ai.util.ExecResult(
+        return inspect_ai.util.ExecResult[str](
             success=result.return_code == 0,
             returncode=result.return_code,
             stdout=stdout,
@@ -128,15 +150,16 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
 
     @override
     async def write_file(self, file: str, contents: str | bytes) -> None:
-        data = contents.encode() if isinstance(contents, str) else contents
+        data = contents.encode("utf-8") if isinstance(contents, str) else contents
         parent = str(pathlib.PurePosixPath(file).parent)
-        if parent not in {"", "."}:
-            made = await self._environment.exec(
-                f"mkdir -p {shlex.quote(parent)}", user=_FILE_TRANSFER_USER
+        if parent not in ("", "."):
+            created = await self._environment.exec(
+                command=f"mkdir -p {shlex.quote(parent)}", user=_FILE_TRANSFER_USER
             )
-            if made.return_code != 0:
+            if created.return_code != 0:
                 raise PermissionError(
-                    made.stderr or made.stdout or f"Could not create {parent}"
+                    f"Could not create {parent} in the sandbox: "
+                    + (created.stderr or created.stdout or "no output")
                 )
         await self._upload_bytes(data, file)
 
@@ -149,19 +172,19 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
     @override
     async def read_file(self, file: str, text: bool = True) -> str | bytes:
         with tempfile.TemporaryDirectory() as directory:
-            local = pathlib.Path(directory) / "file"
+            local_path = pathlib.Path(directory) / "file"
             try:
-                await self._environment.download_file(file, local)
+                await self._environment.download_file(file, local_path)
             except FileNotFoundError:
                 raise
             except Exception as error:
-                if "NotFound" in type(error).__name__:
+                if _is_not_found(error):
                     raise FileNotFoundError(file) from error
                 raise
-            if not local.is_file():
+            if not local_path.is_file():
                 raise FileNotFoundError(file)
-            data = local.read_bytes()
-        return data.decode() if text else data
+            data = local_path.read_bytes()
+        return data.decode("utf-8") if text else data
 
     @override
     def default_polling_interval(self) -> float:
@@ -176,8 +199,8 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
     async def sample_cleanup(
         cls,
         task_name: str,
-        config: inspect_ai.util.SandboxEnvironmentConfigType | None,
-        environments: dict[str, inspect_ai.util.SandboxEnvironment],
+        config: SandboxEnvironmentConfigType | None,
+        environments: dict[str, SandboxEnvironment],
         interrupted: bool,
     ) -> None:
         del task_name, config, environments, interrupted
@@ -188,19 +211,27 @@ class HarborSandboxEnvironment(inspect_ai.util.SandboxEnvironment):
             source.write_bytes(data)
             await self._environment.upload_file(source, target)
 
-    async def _remove_staged(self, path: str, failure: BaseException | None) -> None:
+    async def _remove_staged_stdin(
+        self, path: str, command_error: BaseException | None
+    ) -> None:
         try:
-            result = await self._environment.exec(
-                f"rm -f {shlex.quote(path)}", user=_FILE_TRANSFER_USER
+            removed = await self._environment.exec(
+                command=f"rm -f {shlex.quote(path)}", user=_FILE_TRANSFER_USER
             )
         except Exception as error:
-            if failure is None:
+            if command_error is None:
                 raise
-            failure.add_note(f"Removing staged input {path} also failed: {error!r}")
+            command_error.add_note(
+                f"Removing the staged stdin file {path} also failed: {error!r}"
+            )
             return
-        if result.return_code == 0:
+        if removed.return_code == 0:
             return
-        message = f"Could not remove staged input {path}: {result.stderr or result.stdout or 'no output'}"
-        if failure is None:
+        output = (removed.stderr or removed.stdout or "").strip() or "no output"
+        message = (
+            f"Could not remove the staged stdin file {path}: "
+            + f"rm exited {removed.return_code}: {output}"
+        )
+        if command_error is None:
             raise RuntimeError(message)
-        failure.add_note(message)
+        command_error.add_note(message)
