@@ -116,6 +116,25 @@ class DefaultUpstream:
                     {"x-goog-api-key": self._required("GEMINI_API_KEY")},
                 )
 
+    def api_base(self, *, model: str) -> str:
+        """Return the host-side API base a runner-loop agent calls directly."""
+        provider, separator, _ = model.partition("/")
+        if not separator:
+            raise ValueError(
+                "a runner-loop agent must name its model with a provider prefix"
+            )
+        match provider:
+            case "anthropic":
+                return "https://api.anthropic.com"
+            case "openai":
+                return "https://api.openai.com/v1"
+            case "google":
+                return "https://generativelanguage.googleapis.com"
+            case _:
+                raise ValueError(
+                    f"the default upstream has no API base for provider {provider!r}"
+                )
+
     def _required(self, name: str) -> str:
         value = self.environment.get(name)
         if not value:
