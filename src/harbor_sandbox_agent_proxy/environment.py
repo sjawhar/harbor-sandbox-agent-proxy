@@ -1,13 +1,16 @@
-"""Harbor environment wrapper that removes host credential values from sandbox commands."""
+"""Harbor environment wrapper that confines credentials and locks verifier tests."""
 
 from __future__ import annotations
 
+import dataclasses
+import enum
 import os
 import shlex
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, override
 
+import harbor.environments.base as harbor_environment_base
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.capabilities import EnvironmentCapabilities
 from harbor.models.task.config import EnvironmentConfig, TaskOS
@@ -72,7 +75,6 @@ def _without_protected(
         for name, value in environment.items()
         if not any(secret and secret in value for secret in protected)
     }
-
 
 def _mirror_check(
     holder: PurePosixPath, *, copy: PurePosixPath | None = None
@@ -241,12 +243,14 @@ def _made_mirror(output: str | None, tests_dir: PurePosixPath) -> PurePosixPath:
         )
     return holder
 
+
 class RelayEnvironment(BaseEnvironment):
+    """Delegate lifecycle operations, confine secrets, and lock verifier tests."""
+
     _inner: BaseEnvironment
     _secrets: SecretSource
+    _tests_mirror: _TestsMirror | None
     relay: TrialRelay | None
-
-    """Delegate lifecycle operations while preventing host secrets entering the sandbox."""
 
     def __init__(
         self,
@@ -303,6 +307,7 @@ class RelayEnvironment(BaseEnvironment):
             **raw_kwargs,
             **confined_kwargs,
         )
+
         self._tests_mirror = None
         self.relay = None
         super().__init__(
@@ -329,6 +334,16 @@ class RelayEnvironment(BaseEnvironment):
     def os(self) -> TaskOS:
         return self._inner.os
 
+    @property
+    @override
+    def default_user(self) -> str | int | None:
+        return self._inner.default_user
+
+    @default_user.setter
+    @override
+    def default_user(self, value: str | int | None) -> None:
+        self._inner.default_user = value
+
     def attach_relay(self, relay: TrialRelay) -> None:
         self.relay = relay
         self._secrets = _RelaySecrets(relay)
@@ -340,6 +355,7 @@ class RelayEnvironment(BaseEnvironment):
     def _startup_env(self) -> dict[str, str]:
         return self._confined(self._inner._startup_env()) or {}
 
+    @override
     async def start(self, force_build: bool) -> None:
         self._tests_mirror = None
         await self._inner.start(force_build)
@@ -375,23 +391,128 @@ class RelayEnvironment(BaseEnvironment):
                 + repr(cleanup_error)
             )
 
+    @override
     async def stop(self, delete: bool) -> None:
         relay, self.relay = self.relay, None
+        self._tests_mirror = None
         if relay is not None:
             await relay.close()
         await self._inner.stop(delete)
 
+    @override
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         await self._inner.upload_file(source_path, target_path)
 
+    @override
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
-        await self._inner.upload_dir(source_dir, target_dir)
+        tests_dir = EnvironmentPaths.for_os(self.os).tests_dir
+        if PurePosixPath(target_dir) != tests_dir:
+            await self._inner.upload_dir(source_dir, target_dir)
+            return
+        await self._install_tests(source_dir, tests_dir)
 
+    async def _install_tests(
+        self, source_dir: Path | str, tests_dir: PurePosixPath
+    ) -> None:
+        """Install verifier tests only after they have a private, locked staging tree."""
+        owner = self.default_user if self.default_user is not None else "root"
+        mirror = self._tests_mirror
+        stage, existing = await self._stage_tests(tests_dir, owner, mirror)
+        try:
+            await self._inner.upload_dir(source_dir, str(stage / tests_dir.name))
+            result = await self._exec_as_root(
+                _move_tests_in_script(
+                    tests_dir,
+                    stage,
+                    owner,
+                    existing,
+                    None if mirror is None else mirror.holder,
+                ),
+                what=f"lock verifier tests and move them to {tests_dir}",
+            )
+            holder = (
+                _made_mirror(result.stdout, tests_dir)
+                if mirror is None
+                else mirror.holder
+            )
+        except Exception as error:
+            self._tests_mirror = None
+            await self._discard_stage(stage, error)
+            raise
+        self._tests_mirror = _TestsMirror(holder=holder)
+
+    async def _stage_tests(
+        self,
+        tests_dir: PurePosixPath,
+        owner: str | int,
+        mirror: _TestsMirror | None,
+    ) -> tuple[PurePosixPath, _ExistingTests]:
+        result = await self._exec_as_root(
+            _stage_tests_script(tests_dir, owner, mirror),
+            what=f"stage verifier tests beside {tests_dir}",
+        )
+        lines = (result.stdout or "").strip().splitlines()
+        try:
+            stage = PurePosixPath(lines[-2].strip())
+            existing = _ExistingTests(lines[-1].strip())
+        except (IndexError, ValueError):
+            stage, existing = None, None
+        if (
+            stage is None
+            or existing is None
+            or stage.parent != tests_dir.parent
+            or not stage.name.startswith(_TESTS_STAGE_PREFIX)
+        ):
+            raise RuntimeError(
+                "Staging verifier tests printed no stage and state: "
+                + repr(result.stdout)
+            )
+        return stage, existing
+
+    async def _discard_stage(self, stage: PurePosixPath, error: Exception) -> None:
+        try:
+            result = await self.exec(
+                f"rm -rf -- {shlex.quote(str(stage))}", user="root"
+            )
+        except Exception as cleanup_error:  # noqa: BLE001
+            error.add_note(f"Removing {stage} failed too: {cleanup_error!r}")
+            return
+        if result.return_code != 0:
+            output = (result.stderr or result.stdout or "no output").strip()
+            error.add_note(
+                f"Removing {stage} failed too: exit {result.return_code}: {output}"
+            )
+
+    async def _exec_as_root(self, command: str, *, what: str) -> ExecResult:
+        result = await self.exec(command, user="root")
+        if result.return_code != 0:
+            output = (result.stderr or result.stdout or "no output").strip()
+            raise RuntimeError(
+                f"Could not {what}: exited {result.return_code}: {output}"
+            )
+        return result
+
+    @override
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         await self._inner.download_file(source_path, target_path)
 
+    @override
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         await self._inner.download_dir(source_dir, target_dir)
+
+    @override
+    async def empty_dirs(
+        self,
+        dirs: Sequence[harbor_environment_base.EnvironmentPath],
+        *,
+        chmod: bool = True,
+    ) -> ExecResult | None:
+        tests_dir = EnvironmentPaths.for_os(self.os).tests_dir
+        if self._tests_mirror is not None and any(
+            PurePosixPath(directory) == tests_dir for directory in dirs
+        ):
+            self._tests_mirror = dataclasses.replace(self._tests_mirror, emptied=True)
+        return await self._inner.empty_dirs(dirs, chmod=chmod)
 
     @override
     async def exec(
