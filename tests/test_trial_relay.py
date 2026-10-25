@@ -25,6 +25,7 @@ from harbor_sandbox_agent_proxy import trial_relay
 from harbor_sandbox_agent_proxy.collaborators import (
     BridgedMcpServer,
     RequestDialect,
+    SecretSource,
     UpstreamTarget,
 )
 from harbor_sandbox_agent_proxy.config import RelayConfig
@@ -58,6 +59,11 @@ class _Upstream:
         )
 
 
+class _Secrets:
+    def protected_values(self) -> frozenset[str]:
+        return frozenset({"host-key"})
+
+
 def _settings(**overrides: object) -> RelayConfig:
     return RelayConfig.model_validate(
         {
@@ -73,12 +79,14 @@ def _relay(
     *,
     settings: RelayConfig | None = None,
     environment: BaseEnvironment | None = None,
+    secrets: SecretSource | None = None,
 ) -> TrialRelay:
     return TrialRelay(
         trial=TrialIdentity(name="example__1", directory=Path("/tmp/example__1")),
         config=settings or _settings(),
         upstream=_Upstream(),
         sink=_Sink(),
+        secrets=secrets,
         environment=environment,
         bridged_servers=(
             BridgedMcpServer(
@@ -210,12 +218,14 @@ async def test_proxy_readiness_accepts_a_live_route_that_returns_not_found() -> 
 
 
 def test_the_relay_registers_both_caller_keys_for_redaction() -> None:
-    relay_instance = _relay()
+    secrets = _Secrets()
+    relay_instance = _relay(secrets=secrets)
 
     assert {
         relay_instance.agent_key,
         relay_instance.verifier_key,
     } <= relay_instance.protected_values()
+    assert relay_instance.agent_key not in secrets.protected_values()
     assert relay_instance.agent_key != relay_instance.verifier_key
 
 
@@ -257,9 +267,12 @@ async def test_close_returns_the_outcome_whatever_the_proxy_task_raised(
     await relay_instance.open_agent_phase()
     first = _model_event([_USER], "first reply")
     await _record_events(monkeypatch, relay_instance, first)
+    recorded = list(relay_instance.events)
 
     outcome = await relay_instance.close()
 
+    assert outcome.events[:-1] == recorded
+    assert outcome.events[-1] == TrialEvent(kind="closed", phase="agent", data={})
     assert outcome.answered_agent_calls == 1
     assert outcome.proxy_exit is not None
     assert outcome.proxy_exit["error"] == "ConnectionError('the sandbox pod is gone')"

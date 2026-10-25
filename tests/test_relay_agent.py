@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import contextlib
+import logging
+import operator
+import types
+from collections.abc import AsyncGenerator, Callable, Generator
+from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, cast, override
+from uuid import uuid4
 
 import harbor.agents.base as agent_base
 import harbor.agents.capabilities as agent_capabilities
@@ -14,11 +20,13 @@ import harbor.environments.base as environment_base
 import harbor.models.agent.context as agent_context
 import harbor.models.task.config as task_config
 import harbor.models.trial.paths as trial_paths
+import pydantic
 import pytest
 
-from harbor_sandbox_agent_proxy import agent
+from harbor_sandbox_agent_proxy import agent, trial_relay
 from harbor_sandbox_agent_proxy.collaborators import RequestDialect, UpstreamTarget
 from harbor_sandbox_agent_proxy.config import RelayConfig
+from harbor_sandbox_agent_proxy.trial_relay import TrialRelay
 
 RELAY: dict[str, object] = {
     "polling_interval": 0.25,
@@ -160,7 +168,7 @@ class FailingLoopAgent(LoopAgent):
     ) -> None:
         del instruction, environment, context
         self._write_trajectory("partial trajectory")
-        raise RuntimeError("the agent loop failed")
+        raise RuntimeError("the agent's loop failed")
 
 
 class LoopWithoutApiBase(agent_base.BaseAgent):
@@ -384,12 +392,17 @@ async def test_the_jobs_relay_settings_reach_the_trial_relay_typed(
 
 
 @pytest.mark.parametrize(
-    "relay", [{}, {**RELAY, "polling_interval": 0}, {**RELAY, "gateway": "x"}]
+    ("relay", "field"),
+    [
+        pytest.param({}, "declared_models", id="no-declared-models"),
+        pytest.param({**RELAY, "polling_interval": 0}, "polling_interval", id="bad"),
+        pytest.param({**RELAY, "gateway": "x"}, "gateway", id="unknown-key"),
+    ],
 )
 def test_a_wrapped_agent_refuses_relay_settings_it_cannot_parse(
-    tmp_path: Path, relay: dict[str, object]
+    tmp_path: Path, relay: dict[str, object], field: str
 ) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(pydantic.ValidationError, match=field):
         _ = agent.RelayAgent(
             logs_dir=tmp_path / "logs", agent=_installed_agent_config(), relay=relay
         )
@@ -415,14 +428,41 @@ def test_the_setup_timeout_override_reaches_the_inner_agent(tmp_path: Path) -> N
     assert InstalledAgent.latest.setup_timeout_sec == 900.0
 
 
-def test_a_wrapped_agents_caller_key_is_registered_for_redaction(
-    tmp_path: Path,
+async def test_a_wrapped_agents_caller_key_is_registered_for_redaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    def adapter(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return object()
+
+    @contextlib.contextmanager
+    def bind(environment: object) -> Generator[object]:
+        yield environment
+
+    @contextlib.asynccontextmanager
+    async def proxy(sandbox: object, **kwargs: object) -> AsyncGenerator[object]:
+        del sandbox, kwargs
+        yield types.SimpleNamespace(port=13131)
+
+    async def answered(sandbox: object, *, port: int) -> None:
+        del sandbox, port
+
+    monkeypatch.setattr(agent, "TrialRelay", TrialRelay)
+    monkeypatch.setattr(trial_relay, "HarborSandboxEnvironment", adapter)
+    monkeypatch.setattr(trial_relay, "bind_sandbox_environment", bind)
+    monkeypatch.setattr(trial_relay, "sandbox_model_proxy", proxy)
+    monkeypatch.setattr(trial_relay, "_wait_for_proxy", answered)
     wrapper = _relay_agent(tmp_path, _installed_agent_config())
+    await wrapper.run("do work", _environment(tmp_path), agent_context.AgentContext())
+
     assert InstalledAgent.latest is not None
     key = InstalledAgent.latest.extra_env["ANTHROPIC_API_KEY"]
     assert key == wrapper._agent_key
+    relay = wrapper._relay
+    assert relay is not None
+    assert key in relay.protected_values()
     assert key not in _Secrets().protected_values()
+    _ = await relay.close()
 
 
 def test_a_wrapped_agent_declares_its_inner_agents_capabilities(tmp_path: Path) -> None:
@@ -471,27 +511,58 @@ async def test_each_later_agent_phase_reenters_the_one_relay(tmp_path: Path) -> 
 async def test_a_timeout_while_the_relay_waits_for_its_proxy_leaves_the_verifier_phase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class WaitingRelay(FakeTrialRelay):
-        async def open_agent_phase(self) -> None:
-            await asyncio.Event().wait()
+    relays: list[TrialRelay] = []
 
-    monkeypatch.setattr(agent, "TrialRelay", WaitingRelay)
+    class RecordedTrialRelay(TrialRelay):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            relays.append(self)
+
+    def adapter(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return object()
+
+    @contextlib.contextmanager
+    def bind(environment: object) -> Generator[object]:
+        yield environment
+
+    @contextlib.asynccontextmanager
+    async def proxy(sandbox: object, **kwargs: object) -> AsyncGenerator[object]:
+        del sandbox, kwargs
+        yield types.SimpleNamespace(port=13131)
+
+    probing = asyncio.Event()
+
+    async def answers_after_a_while(sandbox: object, *, port: int) -> None:
+        del sandbox, port
+        probing.set()
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(agent, "TrialRelay", RecordedTrialRelay)
+    monkeypatch.setattr(trial_relay, "HarborSandboxEnvironment", adapter)
+    monkeypatch.setattr(trial_relay, "bind_sandbox_environment", bind)
+    monkeypatch.setattr(trial_relay, "sandbox_model_proxy", proxy)
+    monkeypatch.setattr(trial_relay, "_wait_for_proxy", answers_after_a_while)
     wrapper = _relay_agent(tmp_path, _installed_agent_config())
+    wrapper.context_id = uuid4()
     phase = asyncio.create_task(
         wrapper.run("do work", _environment(tmp_path), agent_context.AgentContext())
     )
-    await asyncio.sleep(0)
+    _ = await probing.wait()
+
     _ = phase.cancel()
     with pytest.raises(asyncio.CancelledError):
         await phase
-    assert WaitingRelay.latest is not None
-    assert WaitingRelay.latest.phase == "verifier"
+
+    (relay,) = relays
     assert InstalledAgent.latest is not None and InstalledAgent.latest.calls == []
-    assert (
-        WaitingRelay.latest.phase_env()["ANTHROPIC_API_KEY"]
-        == WaitingRelay.latest.verifier_key
+    assert relay.phase == "verifier"
+    assert relay.phase_env()["ANTHROPIC_API_KEY"] == relay.verifier_key
+    assert relay.agent_key not in relay.phase_env().values()
+    outcome = await relay.close()
+    assert outcome.refusal_reason == (
+        "the agent made no answered model call through the relay"
     )
-    assert WaitingRelay.latest.agent_key not in WaitingRelay.latest.phase_env().values()
 
 
 async def test_a_runner_loop_resume_keeps_the_host_trajectory(tmp_path: Path) -> None:
@@ -520,15 +591,25 @@ def test_preflight_checks_the_inner_agents_options() -> None:
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    ("kwargs", "message"),
     [
-        {"relay": RELAY},
-        {"agent": {"import_path": "no_such_module:Agent"}, "relay": RELAY},
-        {"agent": {"import_path": f"{__name__}:LoopAgent"}, "relay": {}},
+        pytest.param({"relay": RELAY}, "agent", id="no-agent"),
+        pytest.param(
+            {"agent": {"import_path": "no_such_module:Agent"}, "relay": RELAY},
+            "no_such_module",
+            id="unimportable",
+        ),
+        pytest.param(
+            {"agent": {"import_path": f"{__name__}:LoopAgent"}, "relay": {}},
+            "declared_models",
+            id="no-declared-models",
+        ),
     ],
 )
-def test_preflight_refuses_a_wrapper_it_cannot_build(kwargs: dict[str, object]) -> None:
-    with pytest.raises(Exception):
+def test_preflight_refuses_a_wrapper_it_cannot_build(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
         agent.RelayAgent.preflight(kwargs, {})
 
 
@@ -639,7 +720,7 @@ async def test_a_failed_runner_loop_phase_keeps_its_trajectory(tmp_path: Path) -
             "model_name": "anthropic/claude-test",
         },
     )
-    with pytest.raises(RuntimeError, match="agent loop failed"):
+    with pytest.raises(RuntimeError, match="the agent's loop failed"):
         await wrapper.run(
             "do work", _environment(tmp_path), agent_context.AgentContext()
         )
@@ -649,42 +730,115 @@ async def test_a_failed_runner_loop_phase_keeps_its_trajectory(tmp_path: Path) -
     assert agent.RUNNER_LOOP_OUTCOMES["trial"].runner_atif_sha256 is not None
 
 
+TRIAL_LOGGER = logging.getLogger("harbor-sandbox-agent-proxy-test-trial")
+
+
 @pytest.mark.parametrize(
-    "argument, own, trials",
+    ("argument", "own", "trials", "read", "expected"),
     [
-        ("skills_dir", "/agent/skills", "/trial/skills"),
-        ("load_trajectory", "/agent/trajectory.json", "/trial/trajectory.json"),
+        pytest.param(
+            "skills_dir",
+            "/agent/skills",
+            "/trial/skills",
+            operator.attrgetter("skills_dir"),
+            "/trial/skills",
+            id="skills_dir",
+        ),
+        pytest.param(
+            "load_trajectory",
+            "/agent/trajectory.json",
+            "/trial/trajectory.json",
+            operator.attrgetter("load_trajectory"),
+            Path("/trial/trajectory.json"),
+            id="load_trajectory",
+        ),
+        pytest.param(
+            "environment_logs_dir",
+            "/agent/logs",
+            PurePosixPath("/trial/logs"),
+            operator.attrgetter("environment_logs_dir"),
+            PurePosixPath("/trial/logs"),
+            id="environment_logs_dir",
+        ),
+        pytest.param(
+            "mcp_servers",
+            [{"name": "agent-tools", "transport": "stdio", "command": "tools"}],
+            [
+                task_config.MCPServerConfig(
+                    name="task-tools", transport="streamable-http", url="http://t/"
+                )
+            ],
+            operator.attrgetter("mcp_servers"),
+            [
+                task_config.MCPServerConfig(
+                    name="task-tools", transport="streamable-http", url="http://t/"
+                )
+            ],
+            id="mcp_servers",
+        ),
+        pytest.param(
+            "logger",
+            "the agent's own logger",
+            TRIAL_LOGGER,
+            operator.attrgetter("logger.name"),
+            f"{TRIAL_LOGGER.name}.{agent_base.__name__}",
+            id="logger",
+        ),
     ],
 )
 def test_the_trials_arguments_win_over_the_inner_agents_own_kwargs(
-    tmp_path: Path, argument: str, own: str, trials: str
+    tmp_path: Path,
+    argument: str,
+    own: object,
+    trials: object,
+    read: Callable[[agent_base.BaseAgent], object],
+    expected: object,
 ) -> None:
-    settings = {
-        "logs_dir": tmp_path / "logs",
-        "agent": {
-            "import_path": f"{__name__}:PlainAgent",
-            "kwargs": {argument: own},
-        },
-        "relay": RELAY,
-        "upstream": _Upstream(),
-        "secrets": _Secrets(),
-    }
-    if argument == "skills_dir":
-        _ = agent.RelayAgent(**settings, skills_dir=trials)
-    else:
-        _ = agent.RelayAgent(**settings, load_trajectory=trials)
-    assert PlainAgent.latest is not None
-    assert getattr(PlainAgent.latest, argument) == (
-        Path(trials) if argument == "load_trajectory" else trials
+    from_trial: dict[str, Any] = {argument: trials}
+    _ = agent.RelayAgent(
+        logs_dir=tmp_path / "logs",
+        agent={"import_path": f"{__name__}:PlainAgent", "kwargs": {argument: own}},
+        relay=RELAY,
+        upstream=_Upstream(),
+        secrets=_Secrets(),
+        **from_trial,
     )
+    assert PlainAgent.latest is not None
+    assert read(PlainAgent.latest) == expected
 
 
 @pytest.mark.parametrize(
-    "argument, own",
-    [("skills_dir", "/agent/skills"), ("load_trajectory", "/agent/trajectory.json")],
+    ("argument", "own", "read", "expected"),
+    [
+        pytest.param(
+            "skills_dir",
+            "/agent/skills",
+            operator.attrgetter("skills_dir"),
+            "/agent/skills",
+            id="skills_dir",
+        ),
+        pytest.param(
+            "load_trajectory",
+            "/agent/trajectory.json",
+            operator.attrgetter("load_trajectory"),
+            Path("/agent/trajectory.json"),
+            id="load_trajectory",
+        ),
+        pytest.param(
+            "mcp_servers",
+            [{"name": "agent-tools", "transport": "stdio", "command": "tools"}],
+            operator.attrgetter("mcp_servers"),
+            [{"name": "agent-tools", "transport": "stdio", "command": "tools"}],
+            id="mcp_servers",
+        ),
+    ],
 )
 def test_the_inner_agents_own_kwarg_stands_when_the_trial_passes_none(
-    tmp_path: Path, argument: str, own: str
+    tmp_path: Path,
+    argument: str,
+    own: object,
+    read: Callable[[agent_base.BaseAgent], object],
+    expected: object,
 ) -> None:
     _ = agent.RelayAgent(
         logs_dir=tmp_path / "logs",
@@ -694,6 +848,4 @@ def test_the_inner_agents_own_kwarg_stands_when_the_trial_passes_none(
         secrets=_Secrets(),
     )
     assert PlainAgent.latest is not None
-    assert getattr(PlainAgent.latest, argument) == (
-        Path(own) if argument == "load_trajectory" else own
-    )
+    assert read(PlainAgent.latest) == expected
