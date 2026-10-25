@@ -1,4 +1,4 @@
-"""Portable per-trial records and the default redacted JSON outcome sink."""
+"""Portable relay records and the default redacted JSON event sink."""
 
 from __future__ import annotations
 
@@ -6,9 +6,14 @@ import dataclasses
 import json
 from collections.abc import Collection, Mapping
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import pydantic
+
+if TYPE_CHECKING:
+    from inspect_ai.model import ChatMessage
+
+    from .relay import RelayCall
 
 
 @dataclasses.dataclass(frozen=True)
@@ -21,7 +26,7 @@ class TrialIdentity:
 
 @dataclasses.dataclass(frozen=True)
 class TrialEvent:
-    """A package-owned observation emitted during a trial lifecycle."""
+    """A serializable package-owned observation from a trial lifecycle."""
 
     kind: str
     phase: str
@@ -30,18 +35,29 @@ class TrialEvent:
 
 @dataclasses.dataclass(frozen=True)
 class RelayOutcome:
-    """The redaction-safe terminal facts of a relay lifecycle."""
+    """The complete result of one relay or runner-loop lifecycle.
 
-    trial: TrialIdentity
-    calls: tuple[Mapping[str, object], ...]
-    events: tuple[TrialEvent, ...]
+    Relay mode owns the recorded sandbox proxy calls and selected conversation. A
+    runner-loop agent has no sandbox proxy; its host-side trajectory is retained
+    separately, before Harbor synchronizes the trial directory.
+    """
+
+    mode: Literal["relay", "runner-loop"]
+    calls: list[RelayCall]
+    events: list[TrialEvent]
+    conversation: list[ChatMessage] | None
+    answered_agent_calls: int
     counts: Mapping[str, int]
-    conversation: Mapping[str, object] | None
+    dropped_betas: frozenset[str]
     refusal_reason: str | None
+    proxy_exit: Mapping[str, object] | None
+    runner_atif: Path | None
+    runner_atif_sha256: str | None
+    record_error: str | None
 
 
 class EventSink(Protocol):
-    """Receive package records for one trial without observing credential values."""
+    """Receive redaction-safe package records for one trial."""
 
     async def record(self, event: TrialEvent) -> None: ...
 
@@ -57,7 +73,7 @@ class EventSinkFactory(Protocol):
 
 @dataclasses.dataclass
 class JsonOutcomeSink:
-    """Write a redacted, self-contained default outcome beneath the trial directory."""
+    """Write a redacted, self-contained package outcome beneath a trial directory."""
 
     trial: TrialIdentity
     protected_values: Collection[str] = ()
@@ -70,15 +86,30 @@ class JsonOutcomeSink:
         destination = self.trial.directory / "sandbox-agent-proxy" / "outcome.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, object] = {
-            "trial": outcome.trial.name,
-            "calls": [dict(call) for call in outcome.calls],
+            "trial": self.trial.name,
+            "mode": outcome.mode,
+            "calls": [call.model_dump(mode="json") for call in outcome.calls],
             "events": [
                 {"kind": event.kind, "phase": event.phase, "data": dict(event.data)}
                 for event in outcome.events
             ],
             "counts": dict(outcome.counts),
-            "conversation": outcome.conversation,
+            "conversation": (
+                None
+                if outcome.conversation is None
+                else [
+                    message.model_dump(mode="json") for message in outcome.conversation
+                ]
+            ),
+            "answered_agent_calls": outcome.answered_agent_calls,
+            "dropped_betas": sorted(outcome.dropped_betas),
             "refusal_reason": outcome.refusal_reason,
+            "proxy_exit": outcome.proxy_exit,
+            "runner_atif": (
+                None if outcome.runner_atif is None else str(outcome.runner_atif)
+            ),
+            "runner_atif_sha256": outcome.runner_atif_sha256,
+            "record_error": outcome.record_error,
         }
         destination.write_text(
             json.dumps(_redact(payload, self.protected_values), sort_keys=True),
