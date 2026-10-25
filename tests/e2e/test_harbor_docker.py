@@ -12,9 +12,20 @@ from pathlib import Path
 from typing import Self, override
 
 import pytest
+from harbor.agents.installed.base import BaseInstalledAgent
 
-from harbor_sandbox_agent_proxy.testing.agents import HOST_KEY
+from harbor_sandbox_agent_proxy.testing.agents import (
+    HOST_KEY,
+    MessagesAgent,
+    ResponsesAgent,
+)
 from tests.conftest import skip_if_no_docker
+
+
+def test_e2e_model_agents_run_in_the_sandbox() -> None:
+    assert issubclass(MessagesAgent, BaseInstalledAgent)
+    assert issubclass(ResponsesAgent, BaseInstalledAgent)
+
 
 _AGENTS = "harbor_sandbox_agent_proxy.testing.agents"
 
@@ -128,33 +139,60 @@ def _response_for(path: str, body: dict[str, object]) -> dict[str, object]:
             isinstance(item, dict) and item.get("type") == "function_call_output"
             for item in inputs
         )
-        if body.get("tools") and not has_tool_result:
-            return {
-                "id": "response_tool",
-                "object": "response",
-                "model": body["model"],
-                "output": [
-                    {
-                        "type": "function_call",
-                        "id": "function_id",
-                        "call_id": "call_id",
-                        "name": "echo",
-                        "arguments": json.dumps({"message": "during-agent"}),
-                        "status": "completed",
-                    }
-                ],
-            }
-        return {
-            "id": "response_final",
-            "object": "response",
-            "model": body["model"],
-            "output": [
+        output = (
+            [
+                {
+                    "type": "function_call",
+                    "id": "function_id",
+                    "call_id": "call_id",
+                    "name": "echo",
+                    "arguments": json.dumps({"message": "during-agent"}),
+                    "status": "completed",
+                }
+            ]
+            if body.get("tools") and not has_tool_result
+            else [
                 {
                     "type": "message",
+                    "id": "message_id",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": "relay complete"}],
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "relay complete",
+                            "annotations": [],
+                        }
+                    ],
                 }
-            ],
+            ]
+        )
+        return {
+            "id": "response_tool" if not has_tool_result else "response_final",
+            "object": "response",
+            "created_at": 1_760_000_000,
+            "status": "completed",
+            "model": body["model"],
+            "output": output,
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "metadata": {},
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2,
+                "input_tokens_details": {
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0,
+                },
+                "output_tokens_details": {"reasoning_tokens": 0},
+            },
         }
     raise AssertionError(f"unexpected upstream path {path}")
 
@@ -269,23 +307,33 @@ with urlopen(request, timeout=30) as response:
     assert response.status == 200
 
 
+def expected_refusal(error):
+    if isinstance(error, (KeyboardInterrupt, asyncio.CancelledError)):
+        return False
+    if isinstance(error, BaseExceptionGroup):
+        return all(expected_refusal(member) for member in error.exceptions)
+    return (
+        isinstance(error, Exception)
+        and "not served outside the agent's turn" in str(error)
+    )
+
+
 async def main() -> None:
-    async with streamablehttp_client("http://localhost:13131/mcp/e2e-tools") as streams:
-        read, write, _ = streams
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            try:
+    try:
+        async with streamablehttp_client(
+            "http://localhost:13131/mcp/e2e-tools"
+        ) as streams:
+            read, write, _ = streams
+            async with ClientSession(read, write) as session:
+                await session.initialize()
                 result = await session.call_tool("echo", {"message": "after-agent"})
-            except Exception as error:
-                Path("/logs/verifier/tool-error.txt").write_text(str(error))
-                if "not served outside the agent phase" not in str(error):
-                    raise
-                return
-            if result.isError:
-                if "not served outside the agent phase" in str(result.content):
-                    return
-                raise RuntimeError(f"unexpected post-agent tool error: {result.content}")
-            raise SystemExit("the bridged tool was served after the agent phase")
+                if result.isError:
+                    raise RuntimeError(result.content)
+                raise SystemExit("the bridged tool was served after the agent phase")
+    except BaseException as error:
+        if not expected_refusal(error):
+            raise
+        Path("/logs/verifier/tool-error.txt").write_text(str(error))
 
 
 asyncio.run(main())
@@ -415,7 +463,7 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
     assert any(
         event["kind"] == "refused-tool-call"
         and event["phase"] == "verifier"
-        and event["data"]["reason"] == "outside-agent-phase"
+        and event["data"]["reason"] == "outside the agent's turn"
         for event in payload["events"]
     )
     assert HOST_KEY not in outcome.read_text(encoding="utf-8")

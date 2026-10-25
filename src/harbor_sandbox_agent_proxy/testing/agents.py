@@ -9,7 +9,7 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Final, override
 
-from harbor.agents.base import BaseAgent
+from harbor.agents.installed.base import BaseInstalledAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
@@ -171,7 +171,7 @@ asyncio.run(main())
 """
 
 
-class _E2EAgent(BaseAgent):
+class _E2EAgent(BaseInstalledAgent):
     dialect: str
 
     @override
@@ -183,11 +183,16 @@ class _E2EAgent(BaseAgent):
         del environment
 
     @override
+    async def install(self, environment: BaseEnvironment) -> None:
+        del environment
+
+    @override
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
         del instruction, context
-        result = await environment.exec(
+        result = await self.exec_as_agent(
+            environment,
             f"python3 -c {shlex.quote(_AGENT_PROGRAM)}",
             env={"E2E_DIALECT": self.dialect, "E2E_MCP_URL": _MCP_URL},
         )
