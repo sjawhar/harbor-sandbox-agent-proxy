@@ -22,8 +22,8 @@ import pytest
 from harbor.environments.base import BaseEnvironment
 
 from harbor_sandbox_agent_proxy import model_events, trial_relay
-from harbor_sandbox_agent_proxy.connection import AgentConnection, served_connection_env
 from harbor_sandbox_agent_proxy.config import RelayConfig
+from harbor_sandbox_agent_proxy.connection import AgentConnection, served_connection_env
 from harbor_sandbox_agent_proxy.outcome import EventSink, RelayOutcome, TrialIdentity
 from harbor_sandbox_agent_proxy.relay import RelayCall, RelayPhase, relay_methods
 from harbor_sandbox_agent_proxy.routing import (

@@ -25,15 +25,14 @@ from harbor_sandbox_agent_proxy._inspect_compat import (
     call_tool,
     list_tools,
 )
-from harbor_sandbox_agent_proxy.connection import AgentConnection
 from harbor_sandbox_agent_proxy.config import RelayConfig
+from harbor_sandbox_agent_proxy.connection import AgentConnection
 from harbor_sandbox_agent_proxy.model_events import RELAY_METADATA_KEY
 from harbor_sandbox_agent_proxy.outcome import EventSink, RelayOutcome, TrialIdentity
 from harbor_sandbox_agent_proxy.proxy import _register_bridged_tool_specs
 from harbor_sandbox_agent_proxy.relay import RelayCall, relay_methods
 from harbor_sandbox_agent_proxy.routing import (
     ModelCall,
-    RequestDialect,
     Route,
     auth_headers,
     match_declared,
@@ -103,6 +102,7 @@ async def _route(call: ModelCall) -> Route:
         auth_headers(call.api, "host-key"),
         match_declared(call),
     )
+
 
 def _bridge(specs: Sequence[inspect_ai.agent.BridgedToolsSpec]) -> SandboxAgentBridge:
     bridge = SandboxAgentBridge(

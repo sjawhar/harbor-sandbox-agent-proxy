@@ -32,7 +32,11 @@ from harbor_sandbox_agent_proxy.environment import (
     RunnerSecretExposureError,
     SeparateVerifierEnvironmentError,
 )
-from harbor_sandbox_agent_proxy.outcome import JsonOutcomeSink, RelayOutcome, TrialIdentity
+from harbor_sandbox_agent_proxy.outcome import (
+    JsonOutcomeSink,
+    RelayOutcome,
+    TrialIdentity,
+)
 
 
 @pytest.fixture(autouse=True)

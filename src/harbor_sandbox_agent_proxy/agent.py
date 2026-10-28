@@ -6,7 +6,7 @@ import hashlib
 import shutil
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, Final, Protocol, runtime_checkable, override
+from typing import Any, ClassVar, Final, Protocol, override, runtime_checkable
 from uuid import UUID
 
 import anyio
@@ -26,9 +26,11 @@ from .collaborators import (
     DefaultBridgedToolServerProvider,
     DefaultSecretSource,
     DefaultUpstream,
-    RequestDialect as LegacyRequestDialect,
     SecretSource,
     Upstream,
+)
+from .collaborators import (
+    RequestDialect as LegacyRequestDialect,
 )
 from .config import RelayConfig
 from .connection import AgentConnection, agent_connection

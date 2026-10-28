@@ -149,7 +149,6 @@ _AUTH_HEADER_NAMES: Final = frozenset({"x-api-key", "authorization", "x-goog-api
 GATEWAY_TIMEOUT: Final = httpx.Timeout(900.0, connect=30.0)
 
 
-
 # What Codex does to an MCP server's name to form its tools' namespace: every character
 # outside [A-Za-z0-9_] becomes `_`.
 _CODEX_UNSAFE_NAME_CHARS: Final = re.compile(r"[^A-Za-z0-9_]")
@@ -1067,8 +1066,6 @@ def _safe_request(json_data: dict[str, pydantic.JsonValue]) -> pydantic.JsonValu
     """A compact note of a rejected request's shape, never its (confined-away) content."""
     keys: list[pydantic.JsonValue] = [*sorted(json_data)]
     return {"__refused__": "request rejected before forwarding", "keys": keys}
-
-
 
 
 def _model_name(json_data: dict[str, pydantic.JsonValue]) -> str | None:

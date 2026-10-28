@@ -8,7 +8,12 @@ from typing import Literal
 import inspect_ai.event
 import inspect_ai.model
 
-from harbor_sandbox_agent_proxy.outcome import JsonOutcomeSink, RelayOutcome, TrialIdentity
+from harbor_sandbox_agent_proxy.outcome import (
+    JsonOutcomeSink,
+    RelayOutcome,
+    TrialIdentity,
+)
+
 
 def _outcome(
     *,

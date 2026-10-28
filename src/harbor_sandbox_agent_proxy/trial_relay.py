@@ -455,8 +455,6 @@ def _answered(call: RelayCall, event: inspect_ai.event.ModelEvent) -> bool:
     return call.status is not None and 200 <= call.status < 300 and event.error is None
 
 
-
-
 def _assistant_key(message: inspect_ai.model.ChatMessageAssistant) -> str:
     turn = message.model_dump(
         mode="json",
@@ -523,8 +521,6 @@ async def _wait_for_proxy(
         "the relay proxy did not answer inside the sandbox within "
         + f"{_PROXY_READY_TIMEOUT_SEC:.0f}s: {failure}"
     )
-
-
 
 
 def _now_json() -> str:

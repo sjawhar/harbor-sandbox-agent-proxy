@@ -29,8 +29,8 @@ from harbor.utils.env import resolve_env_vars
 from harbor.utils.import_path import import_class
 
 from .collaborators import DefaultSecretSource, SecretSource
-from .registry import resolve_collaborator
 from .outcome import EventSink, RelayOutcome
+from .registry import resolve_collaborator
 
 logger = logging.getLogger(__name__)
 
