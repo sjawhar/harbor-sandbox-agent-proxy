@@ -30,6 +30,7 @@ from harbor.utils.import_path import import_class
 
 from .collaborators import DefaultSecretSource, SecretSource
 from .registry import resolve_collaborator
+from .outcome import EventSink, RelayOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -316,9 +317,12 @@ class _RelayPhase(Protocol):
     @property
     def verifier_conversation(self) -> object | None: ...
 
+    @property
+    def sink(self) -> EventSink: ...
+
     def phase_env(self) -> dict[str, str]: ...
 
-    async def close(self) -> object: ...
+    async def close(self) -> RelayOutcome: ...
 
 
 @runtime_checkable
@@ -492,7 +496,12 @@ class RelayEnvironment(BaseEnvironment):
         relay, self.relay = self.relay, None
         self._tests_mirror = None
         if relay is not None:
-            await relay.close()
+            outcome: RelayOutcome | None = None
+            try:
+                outcome = await relay.close()
+            finally:
+                if outcome is not None:
+                    await relay.sink.close(outcome)
         await self._inner.stop(delete)
 
     @override

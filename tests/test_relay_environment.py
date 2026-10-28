@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import datetime
 import json
 import logging
 import os
@@ -20,6 +21,8 @@ import harbor.environments.base as harbor_environment_base
 import harbor.environments.capabilities as harbor_capabilities
 import harbor.models.task.config as task_config
 import harbor.models.trial.paths as trial_paths
+import inspect_ai.event
+import inspect_ai.model
 import pytest
 
 from harbor_sandbox_agent_proxy import environment as relay_environment
@@ -29,6 +32,7 @@ from harbor_sandbox_agent_proxy.environment import (
     RunnerSecretExposureError,
     SeparateVerifierEnvironmentError,
 )
+from harbor_sandbox_agent_proxy.outcome import JsonOutcomeSink, RelayOutcome, TrialIdentity
 
 
 @pytest.fixture(autouse=True)
@@ -264,10 +268,41 @@ class FakeInner(harbor_environment_base.BaseEnvironment):
         self.calls.append(_Call(name, args, kwargs))
 
 
+class FakeEventSink:
+    async def record(self, event: inspect_ai.event.Event) -> None:
+        del event
+
+    async def close(self, outcome: RelayOutcome) -> None:
+        del outcome
+
+
+def _empty_relay_outcome() -> RelayOutcome:
+    return RelayOutcome(
+        mode="relay",
+        calls=[],
+        events=[],
+        conversation=None,
+        answered_agent_calls=0,
+        counts={
+            "agent_calls": 0,
+            "verifier_calls": 0,
+            "failed_calls": 0,
+            "refused_calls": 0,
+        },
+        dropped_betas=frozenset(),
+        refusal_reason=None,
+        proxy_exit=None,
+        runner_atif=None,
+        runner_atif_sha256=None,
+        record_error=None,
+    )
+
+
 @dataclasses.dataclass
 class FakeTrialRelay:
     phase: str = "agent"
     verifier_conversation: dict[str, object] | None = None
+    sink: FakeEventSink = dataclasses.field(default_factory=FakeEventSink)
 
     def phase_env(self) -> dict[str, str]:
         if self.phase == "agent":
@@ -287,8 +322,8 @@ class FakeTrialRelay:
     def protected_values(self) -> tuple[()]:
         return ()
 
-    async def close(self) -> None:
-        return None
+    async def close(self) -> RelayOutcome:
+        return _empty_relay_outcome()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -352,6 +387,70 @@ def _environment(
 def _inner() -> FakeInner:
     assert FakeInner.latest is not None
     return FakeInner.latest
+
+
+async def test_stopping_a_relay_writes_the_returned_outcome_to_its_sink(
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    trial = TrialIdentity(
+        name=environment.trial_paths.trial_dir.name,
+        directory=environment.trial_paths.trial_dir,
+    )
+    sink = JsonOutcomeSink(trial, protected=lambda: ())
+    now = datetime.datetime.now(datetime.UTC)
+    event = inspect_ai.event.ModelEvent(
+        model="anthropic/claude-test",
+        input=[],
+        tools=[],
+        tool_choice="none",
+        config=inspect_ai.model.GenerateConfig(),
+        output=inspect_ai.model.ModelOutput(model="claude-test", choices=[]),
+        timestamp=now,
+        completed=now,
+    )
+    outcome = RelayOutcome(
+        mode="relay",
+        calls=[],
+        events=[event],
+        conversation=None,
+        answered_agent_calls=0,
+        counts={
+            "agent_calls": 0,
+            "verifier_calls": 0,
+            "failed_calls": 0,
+            "refused_calls": 0,
+        },
+        dropped_betas=frozenset(),
+        refusal_reason=None,
+        proxy_exit=None,
+        runner_atif=None,
+        runner_atif_sha256=None,
+        record_error=None,
+    )
+
+    @dataclasses.dataclass
+    class OutcomeRelay:
+        sink: JsonOutcomeSink
+        verifier_conversation: None = None
+
+        def phase_env(self) -> dict[str, str]:
+            return {}
+
+        async def close(self) -> RelayOutcome:
+            return outcome
+
+    environment.attach_relay(OutcomeRelay(sink))
+    await environment.start(True)
+    await environment.stop(False)
+
+    written = json.loads(
+        (trial.directory / "sandbox-agent-proxy" / "outcome.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert written["trial"] == trial.name
+    assert written["events"][0]["model"] == "anthropic/claude-test"
 
 
 async def test_delegates_environment_methods_and_default_user_to_the_inner_environment(
