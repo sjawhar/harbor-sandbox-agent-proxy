@@ -79,7 +79,7 @@ def test_host_specific_gateway_check():
         encoding="utf-8",
     )
 
-    result = _run_compare(reference, candidate, "--allow", allow)
+    result = _run_compare(reference, candidate, "--allow", str(allow))
 
     assert result.returncode == 0
     assert "test_host_specific_gateway_check: FEWER 1→0" in result.stdout
