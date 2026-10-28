@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, Final, override
+from typing import Any, ClassVar, Final, Protocol, runtime_checkable, override
 from uuid import UUID
 
 import anyio
@@ -21,17 +21,22 @@ import harbor.models.trial.result as harbor_trial_result
 import pydantic
 
 from .collaborators import (
+    BridgedMcpServer,
     BridgedToolServerProvider,
     DefaultBridgedToolServerProvider,
     DefaultSecretSource,
     DefaultUpstream,
+    RequestDialect as LegacyRequestDialect,
     SecretSource,
     Upstream,
 )
 from .config import RelayConfig
-from .outcome import EventSinkFactory, JsonOutcomeSink, RelayOutcome, TrialIdentity
+from .connection import AgentConnection, agent_connection
+from .outcome import EventSink, JsonOutcomeSink, RelayOutcome, TrialIdentity
 from .registry import resolve_collaborator
 from .relay import mint_caller_key
+from .routing import ModelCall, Route, RouteCall, endpoint_url, match_declared
+from .task_metadata import BridgedMcpServer as TaskBridgedMcpServer
 from .trial_relay import TrialRelay
 
 RUNNER_LOOP_OUTCOMES: dict[str, RelayOutcome] = {}
@@ -43,6 +48,13 @@ type _AgentPhase = Callable[
 ]
 
 
+@runtime_checkable
+class EventSinkFactory(Protocol):
+    """Legacy per-trial sink collaborator, pending the RelayEnvironment host seam."""
+
+    async def open(self, trial: TrialIdentity) -> EventSink: ...
+
+
 class RelayAgent(harbor_agent_base.BaseAgent):
     """Wrap a Harbor agent and install the appropriate relay behavior around it."""
 
@@ -51,6 +63,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
     _inner_config: harbor_trial_config.AgentConfig
     _upstream: Upstream
     _secrets: SecretSource
+    _connection: AgentConnection
     _sink_factory: EventSinkFactory | None
     _bridged_tool_server_provider: BridgedToolServerProvider
     _agent_key: str
@@ -101,6 +114,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         self._installed = issubclass(
             inner_class, harbor_installed_agent_base.BaseInstalledAgent
         )
+        self._connection = _connection(inner_class, self._inner_config)
         self._agent_key = mint_caller_key()
         inner_env = {**self.extra_env}
         inner_kwargs: dict[str, Any] = dict(self._inner_config.kwargs)
@@ -288,21 +302,21 @@ class RelayAgent(harbor_agent_base.BaseAgent):
             name=trial_paths.trial_dir.name, directory=trial_paths.trial_dir
         )
         sink = (
-            JsonOutcomeSink(identity, protected_values=self._secrets.protected_values())
+            JsonOutcomeSink(identity, protected=self._secrets.protected_values)
             if self._sink_factory is None
             else await self._sink_factory.open(identity)
         )
         relay = TrialRelay(
             trial=identity,
             config=self._config,
-            upstream=self._upstream,
+            route=_upstream_route(self._upstream),
             sink=sink,
-            bridged_servers=await self._bridged_tool_server_provider.servers_for(
-                identity.name
+            connection=self._connection,
+            bridged_servers=_bridged_servers(
+                await self._bridged_tool_server_provider.servers_for(identity.name)
             ),
-            secrets=self._secrets,
+            protected=self._secrets.protected_values,
             environment=environment,
-            agent_model=self._inner.model_name,
             agent_key=self._agent_key,
         )
         attach(relay)
@@ -384,6 +398,56 @@ def _sink_factory(value: object | None) -> EventSinkFactory | None:
     if not isinstance(candidate, EventSinkFactory):
         raise TypeError("event_sink_factory must implement open")
     return candidate
+
+
+def _connection(
+    agent_class: type[harbor_agent_base.BaseAgent],
+    config: harbor_trial_config.AgentConfig,
+) -> AgentConnection:
+    """Adapt legacy wrapper agents until RelayEnvironment owns the host connection."""
+    try:
+        return agent_connection(agent_class, config.model_name)
+    except ValueError:
+        return AgentConnection(
+            "anthropic",
+            ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+            ("ANTHROPIC_BASE_URL",),
+        )
+
+
+def _upstream_route(upstream: Upstream) -> RouteCall:
+    """Adapt the legacy endpoint-valued upstream collaborator to the route seam."""
+
+    async def route(call: ModelCall) -> Route:
+        model = match_declared(call)
+        target = await upstream.resolve(
+            dialect=LegacyRequestDialect(call.api.value),
+            model=model,
+        )
+        suffix = endpoint_url("", call.api, model)
+        if not target.url.endswith(suffix):
+            raise RuntimeError(
+                f"upstream URL {target.url!r} does not end with the {call.api.value!r} endpoint"
+            )
+        return Route(target.url.removesuffix(suffix), target.headers, model)
+
+    return route
+
+
+def _bridged_servers(
+    servers: Sequence[BridgedMcpServer],
+) -> tuple[TaskBridgedMcpServer, ...]:
+    """Adapt legacy collaborator records until task metadata owns bridged servers."""
+    return tuple(
+        TaskBridgedMcpServer(
+            name=server.name,
+            command=server.command,
+            args=list(server.args),
+            exclude_tools=list(server.exclude_tools),
+            require_proposal=server.require_proposal,
+        )
+        for server in servers
+    )
 
 
 def _bridged_tool_server_provider(value: object | None) -> BridgedToolServerProvider:

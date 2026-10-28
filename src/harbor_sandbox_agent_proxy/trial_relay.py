@@ -11,12 +11,12 @@ import asyncio
 import contextlib
 import dataclasses
 import datetime
-import hashlib
 import json
 import logging
 import time
-from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Awaitable, TypeGuard
+from collections.abc import Callable, Collection, Sequence
+from typing import Awaitable
+from uuid import uuid4
 
 import anyio
 import harbor.environments.base as harbor_environment_base
@@ -29,10 +29,11 @@ import inspect_ai.util
 import pydantic
 from inspect_ai.agent import BridgedToolsSpec
 
-from .collaborators import BridgedMcpServer, SecretSource, Upstream
+from . import model_events
 from .config import RelayConfig
+from .connection import AgentConnection, served_connection_env
 from .conversation import BridgeConversationSelector
-from .outcome import EventSink, RelayOutcome, TrialEvent, TrialIdentity
+from .outcome import EventSink, RelayOutcome, TrialIdentity
 from .proxy import sandbox_model_proxy
 from .relay import (
     GATEWAY_TIMEOUT,
@@ -42,19 +43,18 @@ from .relay import (
     mint_caller_key,
     relay_methods,
 )
+from .routing import RouteCall
 from .sandbox_adapter import HarborSandboxEnvironment
 from .sandbox_binding import bind_sandbox_environment
-
-if TYPE_CHECKING:
-    from anthropic.types import MessageParam
-    from google.genai.types import ContentDict
-    from openai.types.chat import ChatCompletionMessageParam
-    from openai.types.responses import ResponseInputItemParam
-
+from .task_metadata import BridgedMcpServer
 
 _PROXY_READY_TIMEOUT_SEC = 30.0
 _PROXY_READY_INTERVAL_SEC = 0.1
 logger = logging.getLogger(__name__)
+
+
+def _nothing() -> Collection[str]:
+    return ()
 
 
 @dataclasses.dataclass
@@ -63,18 +63,18 @@ class TrialRelay:
 
     trial: TrialIdentity
     config: RelayConfig
-    upstream: Upstream
+    route: RouteCall
     sink: EventSink
+    connection: AgentConnection
     bridged_servers: Sequence[BridgedMcpServer] = ()
-    secrets: SecretSource | None = None
+    protected: Callable[[], Collection[str]] = _nothing
     environment: harbor_environment_base.BaseEnvironment | None = None
-    agent_model: str | None = None
     agent_key: str = dataclasses.field(default_factory=mint_caller_key)
     port: int | None = None
     phase: RelayPhase = "agent"
     verifier_key: str = dataclasses.field(default_factory=mint_caller_key)
     calls: list[RelayCall] = dataclasses.field(default_factory=list)
-    events: list[TrialEvent] = dataclasses.field(default_factory=list)
+    events: list[inspect_ai.event.Event] = dataclasses.field(default_factory=list)
     verifier_conversation: dict[str, pydantic.JsonValue] | None = None
     refusal_reason: str | None = None
     record_error: Exception | None = None
@@ -100,14 +100,16 @@ class TrialRelay:
     _proxy_exit: dict[str, object] | None = None
     _bridged_tools: tuple[BridgedToolsSpec, ...] = ()
     _caller_keys: set[str] = dataclasses.field(default_factory=set)
-    _initial_events_recorded: bool = False
 
     def __post_init__(self) -> None:
         if self.port is None:
             self.port = self.config.port
         self._caller_keys.update((self.agent_key, self.verifier_key))
-        self._emit_key_minted("agent", self.agent_key)
-        self._emit_key_minted("verifier", self.verifier_key)
+
+    @property
+    def caller_keys(self) -> frozenset[str]:
+        """Every caller key this relay minted across all of its phases."""
+        return frozenset(self._caller_keys)
 
     @property
     def declared_models(self) -> frozenset[str]:
@@ -116,8 +118,7 @@ class TrialRelay:
 
     def protected_values(self) -> frozenset[str]:
         """Expose redaction values in memory only; records never receive key values."""
-        source = () if self.secrets is None else self.secrets.protected_values()
-        return frozenset({*self._caller_keys, *source})
+        return frozenset({*self.caller_keys, *self.protected()})
 
     def mcp_server_configs(self) -> list[harbor_task_config.MCPServerConfig]:
         """The loopback MCP endpoints an installed agent receives when it starts."""
@@ -132,38 +133,22 @@ class TrialRelay:
         ]
 
     def phase_env(self) -> dict[str, str]:
-        """Every managed provider spelling for the current relay phase."""
+        """The current phase's declared model-connection variables."""
         assert self.port is not None
         caller_key = self.agent_key if self.phase == "agent" else self.verifier_key
-        environment = {
-            "ANTHROPIC_API_KEY": caller_key,
-            "ANTHROPIC_AUTH_TOKEN": caller_key,
-            "ANTHROPIC_BASE_URL": f"http://localhost:{self.port}",
-            "OPENAI_API_KEY": caller_key,
-            "OPENAI_BASE_URL": f"http://localhost:{self.port}/v1",
-            "OPENAI_API_BASE": f"http://localhost:{self.port}/v1",
-            "GEMINI_API_KEY": caller_key,
-            "GOOGLE_API_KEY": caller_key,
-            "GOOGLE_GENERATIVE_AI_API_KEY": caller_key,
-            "GOOGLE_GEMINI_BASE_URL": f"http://localhost:{self.port}",
+        connection = self.connection.proxy_env(key=caller_key, port=self.port)
+        if self.phase == "agent":
+            return connection
+        return {
+            **served_connection_env(key=caller_key, port=self.port),
+            **connection,
         }
-        model = self.agent_model or next(iter(sorted(self.declared_models)), None)
-        if model is not None:
-            canonical = model.partition("/")[2] or model
-            environment["ANTHROPIC_SMALL_FAST_MODEL"] = canonical
-            environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = canonical
-        return environment
 
     async def open_agent_phase(self) -> None:
         """Start the proxy and hold its task-bound resources until ``close``."""
         if self._proxy_task is not None:
             raise RuntimeError("the trial relay is already open")
-        if not self._initial_events_recorded:
-            for event in self.events:
-                await self.sink.record(event)
-            self._initial_events_recorded = True
         if self.environment is None:
-            await self._record_phase("agent-opened")
             return
         ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         stop = asyncio.Event()
@@ -176,21 +161,18 @@ class TrialRelay:
             raise
         self._proxy_stop = stop
         self._proxy_task = task
-        await self._record_phase("agent-opened")
 
     async def end_agent_phase(self) -> None:
         """Swap credentials and select the conversation the verifier may inspect."""
         self.phase = "verifier"
         self.verifier_key = mint_caller_key()
         self._caller_keys.add(self.verifier_key)
-        await self._record_key_minted("verifier", self.verifier_key)
         selected = self._selector.selected
         if self._answered_agent_calls == 0 or selected is None:
             self.refusal_reason = (
                 "the agent made no answered model call through the relay"
             )
             self.verifier_conversation = {"refused": self.refusal_reason}
-            await self._record_phase("verifier-opened")
             return
         selected_index = next(
             (
@@ -203,7 +185,6 @@ class TrialRelay:
         if selected_index is None:
             self.refusal_reason = "the relay selected a conversation with no corresponding recorded response"
             self.verifier_conversation = {"refused": self.refusal_reason}
-            await self._record_phase("verifier-opened")
             return
         checked = _conversation_as_recorded(
             selected.messages, self._answered_agent_events[:selected_index]
@@ -211,12 +192,11 @@ class TrialRelay:
         if isinstance(checked, str):
             self.refusal_reason = checked
             self.verifier_conversation = {"refused": checked}
-        else:
-            self._checked_conversation = checked
-            self.verifier_conversation = {
-                "messages": [message.model_dump(mode="json") for message in checked]
-            }
-        await self._record_phase("verifier-opened")
+            return
+        self._checked_conversation = checked
+        self.verifier_conversation = {
+            "messages": [message.model_dump(mode="json") for message in checked]
+        }
 
     async def resume_agent_phase(self) -> None:
         """Re-enter the agent phase for a later step of a multi-step trial."""
@@ -224,10 +204,9 @@ class TrialRelay:
         self.verifier_conversation = None
         self._checked_conversation = None
         self.refusal_reason = None
-        await self._record_phase("agent-resumed")
 
     async def close(self) -> RelayOutcome:
-        """Stop the proxy and return every fact the host-side sink needs."""
+        """Stop the proxy and return every fact the host-side environment needs."""
         task, self._proxy_task = self._proxy_task, None
         stop, self._proxy_stop = self._proxy_stop, None
         if stop is not None:
@@ -249,10 +228,7 @@ class TrialRelay:
                     "phase": self.phase,
                     "error": repr(error),
                 }
-        await self._record_phase("closed")
-        outcome = self._outcome()
-        await self.sink.close(outcome)
-        return outcome
+        return self._outcome()
 
     def _outcome(self) -> RelayOutcome:
         return RelayOutcome(
@@ -327,7 +303,7 @@ class TrialRelay:
                             sandbox,
                             methods=relay_methods(
                                 self.current_policy,
-                                self.upstream,
+                                self.route,
                                 record=self.record,
                                 client=client,
                             ),
@@ -378,12 +354,14 @@ class TrialRelay:
             )
         return specs
 
-    async def _record_refused_tool_call(self, event: TrialEvent) -> None:
+    async def _record_refused_tool_call(
+        self, event: inspect_ai.event.ToolEvent
+    ) -> None:
         self.events.append(event)
         await self.sink.record(event)
 
     async def record(self, call: RelayCall) -> None:
-        """Append a call and its record, preserving the first sink failure."""
+        """Append one call and its Inspect events, preserving the first sink failure."""
         self.calls.append(call)
         self._counts[f"{call.phase}_calls"] += 1
         self._dropped_betas.update(
@@ -392,10 +370,9 @@ class TrialRelay:
             if stripped.startswith("anthropic-beta:")
         )
         try:
-            event = await model_event_from_call(call)
+            event = await model_events.model_event_from_call(call)
             if event is None:
                 self._counts["refused_calls"] += 1
-                await self._record_call_event(call, kind="refused-call")
                 return
             if event.error is not None:
                 self._counts["failed_calls"] += 1
@@ -405,85 +382,20 @@ class TrialRelay:
                 and _answered(call, event)
             ):
                 if self._answered_agent_events:
-                    for tool_event in _tool_events_between(
+                    for tool_event in model_events.tool_events_between(
                         self._answered_agent_events[-1], event.input
                     ):
-                        await self._record_event(tool_event)
+                        self.events.append(tool_event)
+                        await self.sink.record(tool_event)
                 self._selector.observe(event.input, event.output)
                 self._answered_agent_events.append(event)
                 self._answered_agent_calls += 1
-            await self._record_event(event)
+            self.events.append(event)
+            await self.sink.record(event)
         except Exception as error:
             if self.record_error is None:
                 self.record_error = error
             raise
-
-    async def _record_call_event(self, call: RelayCall, *, kind: str) -> None:
-        event = TrialEvent(
-            kind=kind,
-            phase=call.phase,
-            data={
-                "method": call.method,
-                "model": call.model,
-                "status": call.status,
-                "refused": call.refused,
-                "stripped": list(call.stripped),
-            },
-        )
-        self.events.append(event)
-        await self.sink.record(event)
-
-    async def _record_event(
-        self, event: inspect_ai.event.ModelEvent | inspect_ai.event.ToolEvent
-    ) -> None:
-        if isinstance(event, inspect_ai.event.ToolEvent):
-            record = TrialEvent(
-                kind="tool-call",
-                phase=self.phase,
-                data={
-                    "id": event.id,
-                    "function": event.function,
-                    "arguments": event.arguments,
-                    "result": event.result if isinstance(event.result, str) else "",
-                    "error": None if event.error is None else event.error.message,
-                    "metadata": event.metadata or {},
-                },
-            )
-        else:
-            record = TrialEvent(
-                kind="model-call",
-                phase=self.phase,
-                data={
-                    "model": event.model,
-                    "error": event.error,
-                    "metadata": event.metadata or {},
-                },
-            )
-        self.events.append(record)
-        await self.sink.record(record)
-
-    def _emit_key_minted(self, phase: RelayPhase, key: str) -> None:
-        self.events.append(
-            TrialEvent(
-                kind="caller-key-minted",
-                phase=phase,
-                data={"fingerprint": _fingerprint(key)},
-            )
-        )
-
-    async def _record_key_minted(self, phase: RelayPhase, key: str) -> None:
-        event = TrialEvent(
-            kind="caller-key-minted",
-            phase=phase,
-            data={"fingerprint": _fingerprint(key)},
-        )
-        self.events.append(event)
-        await self.sink.record(event)
-
-    async def _record_phase(self, kind: str) -> None:
-        event = TrialEvent(kind=kind, phase=self.phase, data={})
-        self.events.append(event)
-        await self.sink.record(event)
 
 
 def phase_guarded_tool(
@@ -491,7 +403,7 @@ def phase_guarded_tool(
     *,
     server: str,
     phase: Callable[[], RelayPhase],
-    refused: Callable[[TrialEvent], Awaitable[None]],
+    refused: Callable[[inspect_ai.event.ToolEvent], Awaitable[None]],
 ) -> inspect_ai.tool.Tool:
     """Serve a bridged task tool only during the agent's turn."""
     inner = inspect_ai.tool.ToolDef(tool)
@@ -500,16 +412,27 @@ def phase_guarded_tool(
         current = phase()
         if current == "agent":
             return await tool(**arguments)
-        message = f"{server}/{inner.name} is not served outside the agent's turn (relay phase: {current})"
+        message = (
+            f"{server}/{inner.name} is not served outside the agent's turn "
+            f"(relay phase: {current})"
+        )
+        now = datetime.datetime.now(datetime.UTC)
         await refused(
-            TrialEvent(
-                kind="refused-tool-call",
-                phase=current,
-                data={
-                    "server": server,
-                    "tool": inner.name,
-                    "arguments": arguments,
-                    "reason": "outside the agent's turn",
+            inspect_ai.event.ToolEvent(
+                id=str(uuid4()),
+                function=inner.name,
+                arguments=arguments,
+                result="",
+                error=inspect_ai.tool.ToolCallError("permission", message),
+                pending=False,
+                timestamp=now,
+                completed=now,
+                metadata={
+                    model_events.RELAY_METADATA_KEY: {
+                        "phase": current,
+                        "server": server,
+                        "refused": "outside the agent's turn",
+                    }
                 },
             )
         )
@@ -528,165 +451,10 @@ def phase_guarded_tool(
     ).as_tool()
 
 
-async def model_event_from_call(call: RelayCall) -> inspect_ai.event.ModelEvent | None:
-    """Convert a recorded successful provider call into the selector's Inspect event."""
-    if not call.authenticated:
-        return None
-    failure = _call_error(call)
-    messages: list[inspect_ai.model.ChatMessage] = []
-    output: inspect_ai.model.ModelOutput | None = None
-    try:
-        if not isinstance(call.request, dict):
-            raise ValueError("relay request is not an object")
-        if call.method == "generate_anthropic":
-            raw = call.request.get("messages")
-            if not _is_anthropic_messages(raw):
-                raise ValueError("Anthropic request holds no message list")
-            messages = await inspect_ai.model.messages_from_anthropic(raw)
-            if failure is None and isinstance(call.response, dict):
-                output = await inspect_ai.model.model_output_from_anthropic(
-                    call.response
-                )
-        elif call.method == "generate_completions":
-            raw = call.request.get("messages")
-            if not _is_completion_messages(raw):
-                raise ValueError("Chat Completions request holds no message list")
-            messages = await inspect_ai.model.messages_from_openai(
-                raw, model=call.model
-            )
-            if failure is None and isinstance(call.response, dict):
-                output = await inspect_ai.model.model_output_from_openai(call.response)
-        elif call.method == "generate_responses":
-            raw = call.request.get("input")
-            if isinstance(raw, str):
-                messages = await inspect_ai.model.messages_from_openai_responses(
-                    [{"role": "user", "content": raw}], model=call.model
-                )
-            elif _is_response_items(raw):
-                messages = await inspect_ai.model.messages_from_openai_responses(
-                    raw, model=call.model
-                )
-            else:
-                raise ValueError("Responses request holds no input")
-            if failure is None and isinstance(call.response, dict):
-                output = await inspect_ai.model.model_output_from_openai_responses(
-                    call.response
-                )
-        elif call.method == "generate_google":
-            raw = call.request.get("contents")
-            if not _is_google_contents(raw):
-                raise ValueError("Gemini request holds no contents")
-            messages = await inspect_ai.model.messages_from_google(
-                raw, model=call.model
-            )
-            if failure is None and isinstance(call.response, dict):
-                output = await inspect_ai.model.model_output_from_google(
-                    call.response, model=call.model
-                )
-        else:
-            raise ValueError(f"relay method {call.method!r} has no converter")
-    except (ValueError, TypeError, KeyError) as error:
-        failure = (
-            failure
-            or f"{call.method}: conversion failed: {type(error).__name__}: {error}"
-        )
-        messages = []
-    if output is None:
-        output = inspect_ai.model.ModelOutput(
-            model=call.model or "", choices=[], error=failure
-        )
-    return inspect_ai.event.ModelEvent(
-        model=call.provider if call.model is None else f"{call.provider}/{call.model}",
-        input=messages,
-        tools=[],
-        tool_choice="none",
-        config=inspect_ai.model.GenerateConfig(),
-        output=output,
-        error=failure,
-        timestamp=call.ts_request,
-        completed=call.ts_response,
-        working_time=call.latency_ms / 1000.0 if failure is None else None,
-        metadata={
-            "sandbox_agent_proxy": {
-                "phase": call.phase,
-                "status": call.status,
-                "latency_ms": call.latency_ms,
-                "stripped": list(call.stripped),
-            }
-        },
-    )
-
-
-def _is_anthropic_messages(value: object) -> TypeGuard[list[MessageParam]]:
-    return _is_list_of_objects(value)
-
-
-def _is_completion_messages(
-    value: object,
-) -> TypeGuard[list[ChatCompletionMessageParam]]:
-    return _is_list_of_objects(value)
-
-
-def _is_response_items(value: object) -> TypeGuard[list[ResponseInputItemParam]]:
-    return _is_list_of_objects(value)
-
-
-def _is_google_contents(value: object) -> TypeGuard[list[ContentDict]]:
-    return _is_list_of_objects(value)
-
-
-def _is_list_of_objects(value: object) -> bool:
-    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
-
-
-def _tool_events_between(
-    previous: inspect_ai.event.ModelEvent,
-    next_input: Sequence[inspect_ai.model.ChatMessage],
-) -> list[inspect_ai.event.ToolEvent]:
-    if not previous.output.choices:
-        return []
-    results = {
-        message.tool_call_id: message
-        for message in next_input
-        if isinstance(message, inspect_ai.model.ChatMessageTool)
-        and message.tool_call_id
-    }
-    when = previous.completed or previous.timestamp
-    events: list[inspect_ai.event.ToolEvent] = []
-    for tool_call in previous.output.message.tool_calls or []:
-        result = results.get(tool_call.id)
-        if result is None:
-            continue
-        events.append(
-            inspect_ai.event.ToolEvent(
-                id=tool_call.id,
-                function=tool_call.function,
-                arguments=tool_call.arguments,
-                result=result.text,
-                error=result.error,
-                timestamp=when,
-                completed=when,
-                metadata={"source": "sandbox_agent_proxy"},
-            )
-        )
-    return events
-
-
 def _answered(call: RelayCall, event: inspect_ai.event.ModelEvent) -> bool:
     return call.status is not None and 200 <= call.status < 300 and event.error is None
 
 
-def _call_error(call: RelayCall) -> str | None:
-    if (
-        call.status is not None
-        and 200 <= call.status < 300
-        and isinstance(call.response, dict)
-    ):
-        return None
-    body = json.dumps(call.response, separators=(",", ":"))
-    if call.status is None:
-        return f"{call.method}: the request never reached the upstream: {body}"
-    return f"{call.method}: the upstream returned HTTP {call.status}: {body}"
 
 
 def _assistant_key(message: inspect_ai.model.ChatMessageAssistant) -> str:
@@ -757,8 +525,6 @@ async def _wait_for_proxy(
     )
 
 
-def _fingerprint(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
 def _now_json() -> str:

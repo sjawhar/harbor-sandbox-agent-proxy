@@ -64,7 +64,15 @@ import pydantic
 import pytest
 
 from harbor_sandbox_agent_proxy import relay
-from harbor_sandbox_agent_proxy.collaborators import RequestDialect, UpstreamTarget
+from harbor_sandbox_agent_proxy.routing import (
+    ModelCall,
+    RequestDialect,
+    Route,
+    RouteCall,
+    RouteRefused,
+    auth_headers,
+    match_declared,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -98,39 +106,15 @@ class _Recorder:
         return self._responder(request)
 
 
-class _Upstream:
-    """Injected host-side route and credential source for relay tests."""
+def _route(
+    token: Callable[[], str], *, base: str = "https://gw.test/anthropic"
+) -> RouteCall:
+    """Return a host-owned route that admits the launch's declared model."""
 
-    def __init__(self, token: Callable[[], str]) -> None:
-        self._token = token
+    async def route(call: ModelCall) -> Route:
+        return Route(base, auth_headers(call.api, token()), match_declared(call))
 
-    async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget:
-        token = self._token()
-        match dialect:
-            case RequestDialect.MESSAGES:
-                return UpstreamTarget(
-                    "https://gw.test/anthropic/v1/messages", {"x-api-key": token}
-                )
-            case RequestDialect.CHAT_COMPLETIONS:
-                return UpstreamTarget(
-                    "https://gw.test/openai/v1/chat/completions",
-                    {"authorization": f"Bearer {token}"},
-                )
-            case RequestDialect.RESPONSES:
-                return UpstreamTarget(
-                    "https://gw.test/openai/v1/responses",
-                    {"authorization": f"Bearer {token}"},
-                )
-            case RequestDialect.GEMINI:
-                return UpstreamTarget(
-                    "https://gw.test/google-ai/v1beta/models/"
-                    + f"{model}:streamGenerateContent?alt=sse",
-                    {"x-goog-api-key": token},
-                )
-
-
-def _gateway(token: Callable[[], str]) -> _Upstream:
-    return _Upstream(token)
+    return route
 
 
 # Every model the forwarding tests name, declared so the mandatory model pin admits them.
@@ -220,6 +204,7 @@ async def _call(
     headers: dict[str, str] | None = None,
     token: _Token | None = None,
     policy: relay.RelayPolicy | None = None,
+    route: RouteCall | None = None,
 ) -> _Outcome:
     the_token = token if token is not None else _Token()
     recorder = _Recorder(responder)
@@ -232,10 +217,11 @@ async def _call(
     # to exercise a forged caller.
     sent_headers = {"x-api-key": _CALLER_KEY, **(headers or {})}
     the_policy = policy if policy is not None else _policy()
+    host_route = route if route is not None else _route(the_token)
     async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
         methods = relay.relay_methods(
             lambda: ("agent", the_policy),
-            _gateway(the_token),
+            host_route,
             record=record,
             client=client,
         )
@@ -313,7 +299,7 @@ async def test_openai_completions_uses_bearer_and_chat_completions_path() -> Non
     )
 
     request = outcome.recorder.requests[0]
-    assert str(request.url) == "https://gw.test/openai/v1/chat/completions"
+    assert str(request.url) == "https://gw.test/anthropic/chat/completions"
     assert request.headers["authorization"] == "Bearer launch-token"
     assert "authorization" not in outcome.calls[0].headers
 
@@ -326,7 +312,7 @@ async def test_openai_responses_uses_responses_path() -> None:
     )
 
     assert (
-        str(outcome.recorder.requests[0].url) == "https://gw.test/openai/v1/responses"
+        str(outcome.recorder.requests[0].url) == "https://gw.test/anthropic/responses"
     )
 
 
@@ -383,7 +369,7 @@ async def test_google_strips_injected_model_and_always_streams_upstream() -> Non
     request = outcome.recorder.requests[0]
     assert (
         str(request.url)
-        == "https://gw.test/google-ai/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse"
+        == "https://gw.test/anthropic/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse"
     )
     assert request.headers["x-goog-api-key"] == "launch-token"
     assert (
@@ -421,7 +407,7 @@ async def test_twenty_concurrent_calls_are_twenty_records() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
         generate = relay.relay_methods(
-            lambda: ("agent", _policy()), _gateway(token), record=record, client=client
+            lambda: ("agent", _policy()), _route(token), record=record, client=client
         )["generate_anthropic"]
         await asyncio.gather(
             *(
@@ -440,7 +426,7 @@ async def test_token_is_consulted_once_per_call() -> None:
     token = _Token()
 
     def responder(request: httpx.Request) -> httpx.Response:
-        if "google-ai" in str(request.url):
+        if "v1beta/models/" in str(request.url):
             return httpx.Response(
                 200,
                 text='data: {"candidates": [{"index": 0, "finishReason": "STOP"}]}\n\n',
@@ -455,7 +441,7 @@ async def test_token_is_consulted_once_per_call() -> None:
         transport=httpx.MockTransport(_Recorder(responder))
     ) as client:
         methods = relay.relay_methods(
-            lambda: ("agent", _policy()), _gateway(token), record=record, client=client
+            lambda: ("agent", _policy()), _route(token), record=record, client=client
         )
         key = {"x-api-key": _CALLER_KEY}
         await methods["generate_anthropic"]({"model": "m"}, key)
@@ -477,7 +463,7 @@ async def test_a_record_callback_that_fails_raises_out_of_the_handler() -> None:
     ) as client:
         methods = relay.relay_methods(
             lambda: ("agent", _policy()),
-            _gateway(_Token()),
+            _route(_Token()),
             record=record,
             client=client,
         )
@@ -1376,7 +1362,7 @@ async def test_a_caller_presenting_no_key_at_all_is_refused() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
         methods = relay.relay_methods(
             lambda: ("agent", _policy()),
-            _gateway(_Token()),
+            _route(_Token()),
             record=record,
             client=client,
         )
@@ -1397,6 +1383,92 @@ async def test_a_bearer_caller_authenticates() -> None:
 
     assert len(outcome.recorder.requests) == 1
     assert outcome.calls[0].authenticated is True
+
+
+# --- host routing -----------------------------------------------------------------------
+
+
+async def test_a_route_refusal_is_recorded_as_a_provider_error() -> None:
+    async def refuse(_call: ModelCall) -> Route:
+        raise RouteRefused("the host refused this model")
+
+    outcome = await _call(
+        "generate_anthropic",
+        {"model": "m", "messages": []},
+        _responds(200, {"content": []}),
+        route=refuse,
+    )
+
+    assert "the host refused this model" in str(outcome.error["message"])
+    assert outcome.recorder.requests == []
+    [call] = outcome.calls
+    assert call.request == {
+        "__refused__": "request rejected before forwarding",
+        "keys": ["messages", "model"],
+    }
+    assert call.refused is not None
+
+
+async def test_a_route_runtime_error_propagates_out_of_the_handler() -> None:
+    async def broken(_call: ModelCall) -> Route:
+        raise RuntimeError("route source is unavailable")
+
+    with pytest.raises(RuntimeError, match="route source is unavailable"):
+        _ = await _call(
+            "generate_anthropic",
+            {"model": "m", "messages": []},
+            _responds(200, {"content": []}),
+            route=broken,
+        )
+
+
+async def test_a_google_route_model_controls_the_endpoint_and_leaves_the_body_model_free() -> (
+    None
+):
+    async def route(_call: ModelCall) -> Route:
+        return Route(
+            "https://gw.test/routed",
+            auth_headers(RequestDialect.GEMINI, "route-token"),
+            "gemini-routed",
+        )
+
+    outcome = await _call(
+        "generate_google",
+        {"model": "g", "contents": []},
+        _sse_events_responds([{"candidates": [{"index": 0, "finishReason": "STOP"}]}]),
+        route=route,
+    )
+
+    request = outcome.recorder.requests[0]
+    assert (
+        str(request.url)
+        == "https://gw.test/routed/v1beta/models/gemini-routed:streamGenerateContent?alt=sse"
+    )
+    assert request.headers["x-goog-api-key"] == "route-token"
+    assert "model" not in outcome.forwarded
+    assert outcome.calls[0].model == "gemini-routed"
+
+
+async def test_an_invalid_google_route_model_is_refused_after_normalization() -> None:
+    async def route(_call: ModelCall) -> Route:
+        return Route(
+            "https://gw.test/routed",
+            auth_headers(RequestDialect.GEMINI, "route-token"),
+            "not/a-model-id",
+        )
+
+    body: _Json = {"model": "g", "contents": []}
+    outcome = await _call(
+        "generate_google",
+        body,
+        _sse_events_responds([{"candidates": [{"index": 0, "finishReason": "STOP"}]}]),
+        route=route,
+    )
+
+    assert "not a valid model id" in str(outcome.error["message"])
+    assert outcome.recorder.requests == []
+    assert "model" not in body
+    assert outcome.calls[0].request == body
 
 
 # --- the model pin ------------------------------------------------------------------------
@@ -1451,19 +1523,19 @@ async def test_a_provider_qualified_wire_model_is_refused_even_when_declared() -
             "generate_completions",
             "openai/gpt",
             "gpt",
-            "https://gw.test/openai/v1/chat/completions",
+            "https://gw.test/anthropic/chat/completions",
         ),
         (
             "generate_responses",
             "openai/gpt",
             "gpt",
-            "https://gw.test/openai/v1/responses",
+            "https://gw.test/anthropic/responses",
         ),
         (
             "generate_google",
             "google/gemini-2.0",
             "gemini-2.0",
-            "https://gw.test/google-ai/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse",
+            "https://gw.test/anthropic/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse",
         ),
     ],
 )
@@ -1593,7 +1665,7 @@ async def test_the_verifier_phase_forwards_a_beta_the_agent_phase_drops() -> Non
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
         generate = relay.relay_methods(
-            lambda: current[0], _gateway(_Token()), record=record, client=client
+            lambda: current[0], _route(_Token()), record=record, client=client
         )["generate_anthropic"]
         await generate(
             {"model": "m"}, {"x-api-key": "agent-key", "anthropic-beta": "a,b"}
@@ -1651,7 +1723,7 @@ async def test_a_phase_at_its_cap_refuses_further_calls_and_the_next_phase_start
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
         generate = relay.relay_methods(
-            lambda: current[0], _gateway(_Token()), record=record, client=client
+            lambda: current[0], _route(_Token()), record=record, client=client
         )["generate_anthropic"]
         key = {"x-api-key": _CALLER_KEY}
         first = await generate({"model": "m"}, key)
@@ -1692,7 +1764,7 @@ async def test_concurrent_calls_reserve_the_call_cap_before_the_gateway_await() 
     async with httpx.AsyncClient(transport=transport) as client:
         generate = relay.relay_methods(
             lambda: ("agent", _policy(max_calls=1)),
-            _gateway(_Token()),
+            _route(_Token()),
             record=record,
             client=client,
         )["generate_anthropic"]
@@ -1744,7 +1816,7 @@ async def test_concurrent_calls_reserve_the_recorded_byte_cap_before_the_gateway
     async with httpx.AsyncClient(transport=transport) as client:
         generate = relay.relay_methods(
             lambda: ("agent", _policy(max_recorded_bytes=cap)),
-            _gateway(_Token()),
+            _route(_Token()),
             record=record,
             client=client,
         )["generate_anthropic"]

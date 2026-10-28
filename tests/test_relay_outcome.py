@@ -1,21 +1,23 @@
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
+from typing import Literal
 
-from harbor_sandbox_agent_proxy.outcome import (
-    JsonOutcomeSink,
-    RelayOutcome,
-    TrialEvent,
-    TrialIdentity,
-)
+import inspect_ai.event
+import inspect_ai.model
 
+from harbor_sandbox_agent_proxy.outcome import JsonOutcomeSink, RelayOutcome, TrialIdentity
 
 def _outcome(
-    *, mode: str, runner_atif: Path | None, sha256: str | None
+    *,
+    mode: Literal["relay", "runner-loop"],
+    runner_atif: Path | None,
+    sha256: str | None,
 ) -> RelayOutcome:
     return RelayOutcome(
-        mode=mode,  # type: ignore[arg-type]
+        mode=mode,
         calls=[],
         events=[],
         conversation=None,
@@ -54,16 +56,23 @@ def test_relay_outcome_keeps_relay_and_runner_loop_results_distinct() -> None:
     assert runner_loop.runner_atif_sha256 == "a" * 64
 
 
-async def test_json_outcome_sink_writes_redacted_package_records(
+async def test_json_outcome_sink_writes_redacted_inspect_events(
     tmp_path: Path,
 ) -> None:
     secret = "host-key-not-for-sandbox"
     trial = TrialIdentity(name="trial-1", directory=tmp_path)
-    sink = JsonOutcomeSink(trial, protected_values=(secret,))
-    event = TrialEvent(
-        kind="caller-key-minted",
-        phase="agent",
-        data={"fingerprint": "not-a-secret"},
+    sink = JsonOutcomeSink(trial, protected=lambda: frozenset({secret}))
+    now = datetime.datetime.now(datetime.UTC)
+    event = inspect_ai.event.ModelEvent(
+        model="anthropic/claude-test",
+        input=[],
+        tools=[],
+        tool_choice="none",
+        config=inspect_ai.model.GenerateConfig(),
+        output=inspect_ai.model.ModelOutput(model="claude-test", choices=[]),
+        metadata={"host_key": secret},
+        timestamp=now,
+        completed=now,
     )
     await sink.record(event)
 
@@ -82,10 +91,5 @@ async def test_json_outcome_sink_writes_redacted_package_records(
     )
     assert written["trial"] == "trial-1"
     assert written["mode"] == "relay"
-    assert written["events"] == [
-        {
-            "kind": "caller-key-minted",
-            "phase": "agent",
-            "data": {"fingerprint": "not-a-secret"},
-        }
-    ]
+    assert written["events"][0]["model"] == "anthropic/claude-test"
+    assert written["events"][0]["metadata"] == {"host_key": "[REDACTED]"}

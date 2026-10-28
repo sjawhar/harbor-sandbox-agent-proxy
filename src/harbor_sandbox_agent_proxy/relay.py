@@ -109,7 +109,7 @@ import httpx
 import pydantic
 from inspect_ai.agent._bridge._errors import PROVIDER_ERROR_KEY
 
-from .collaborators import RequestDialect, Upstream
+from .routing import ModelCall, RequestDialect, RouteCall, RouteRefused, endpoint_url
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -148,7 +148,6 @@ _AUTH_HEADER_NAMES: Final = frozenset({"x-api-key", "authorization", "x-goog-api
 # minutes. The timeout the owner of the handlers' ``httpx.AsyncClient`` builds it with.
 GATEWAY_TIMEOUT: Final = httpx.Timeout(900.0, connect=30.0)
 
-_MODEL_NAME_RE: Final = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 # What Codex does to an MCP server's name to form its tools' namespace: every character
@@ -442,7 +441,7 @@ class _Forwarder:
     """The shared state the four ``generate_*`` handlers forward through."""
 
     policy: PolicyGetter
-    upstream: Upstream
+    route: RouteCall
     record: RecordCall
     client: httpx.AsyncClient
     usage: dict[RelayPhase, _PhaseUsage] = dataclasses.field(
@@ -469,15 +468,13 @@ class _Endpoint:
 
 def relay_methods(
     policy: PolicyGetter,
-    upstream: Upstream,
+    route: RouteCall,
     *,
     record: RecordCall,
     client: httpx.AsyncClient,
 ) -> dict[str, GenerateMethod]:
-    """Build the four ``generate_*`` handlers for an injected ``Upstream``."""
-    forwarder = _Forwarder(
-        policy=policy, upstream=upstream, record=record, client=client
-    )
+    """Build the four ``generate_*`` handlers for a host-provided ``route``."""
+    forwarder = _Forwarder(policy=policy, route=route, record=record, client=client)
     endpoints = (
         _Endpoint(
             "generate_anthropic",
@@ -562,19 +559,30 @@ class _Call:
                 authenticated=False,
             )
 
-        # 2) Confine the request, select its declared model, then normalize the body. Model
-        # selection must precede normalization because Gemini removes ``model`` from its
-        # body after the selected declaration supplies the upstream route.
+        # 2) Confine the request, then ask the host whether and where it may run. The
+        # host selects the recorded model; Google normalization removes that model from
+        # the request only after the host has selected it.
+        stripped: list[str] = []
         try:
             body = self._json_data
             stripped = self._endpoint.confine(body, self._policy)
-            self._model = _enforce_model_pin(
-                self._wire_model, self._endpoint.provider, self._policy
+            route = await self._forwarder.route(
+                ModelCall(
+                    self._endpoint.dialect,
+                    self._wire_model,
+                    tuple(sorted(self._policy.allowed_models)),
+                )
             )
-            assert self._model is not None
+            self._model = route.model
             if body.get("model") != self._model:
                 body["model"] = self._model
             self._endpoint.normalize(body)
+        except RouteRefused as refusal:
+            return await self._refuse(
+                f"{method}: {refusal}",
+                request=_safe_request(self._json_data),
+                stripped=stripped,
+            )
         except _RejectedRequest as rejection:
             return await self._refuse(
                 f"{method}: {rejection.message}",
@@ -582,23 +590,24 @@ class _Call:
                 stripped=rejection.stripped,
             )
 
-        # 3) Resolve the destination and authentication material at the host boundary.
-        # The collaborator, not this relay, owns provider routing and host credentials.
-        target = await self._forwarder.upstream.resolve(
-            dialect=self._endpoint.dialect, model=self._model
-        )
+        # 3) Join the host's base URL to the endpoint, then add allowed request metadata.
+        assert self._model is not None
         try:
+            url = endpoint_url(route.base_url, self._endpoint.dialect, self._model)
             headers, dropped_betas = _upstream_headers(
                 self._endpoint.provider,
-                target.headers,
+                route.headers,
                 self._incoming,
                 self._policy,
+            )
+        except RouteRefused as refusal:
+            return await self._refuse(
+                f"{method}: {refusal}", request=body, stripped=stripped
             )
         except _RejectedRequest as rejection:
             return await self._refuse(
                 f"{method}: {rejection.message}", request=body, stripped=stripped
             )
-        url = target.url
         stripped = [*stripped, *dropped_betas]
         recorded_headers = {
             key: value
@@ -1060,36 +1069,6 @@ def _safe_request(json_data: dict[str, pydantic.JsonValue]) -> pydantic.JsonValu
     return {"__refused__": "request rejected before forwarding", "keys": keys}
 
 
-def _enforce_model_pin(
-    model: str | None, endpoint: _Provider, policy: RelayPolicy
-) -> str:
-    """Select the declared model that permits ``model`` on ``endpoint``.
-
-    Provider-specific model parsing and routing live in the injected upstream. The relay
-    only strips its own endpoint's optional prefix and requires one declared equivalent.
-    """
-    if model is None:
-        raise _RejectedRequest(
-            f"model {model!r} is not one the launch declared for this phase "
-            + f"({sorted(policy.allowed_models)})"
-        )
-    wire = _model_name_for_endpoint(model, endpoint)
-    matches = [
-        declared
-        for declared in policy.allowed_models
-        if _declared_model_name(declared, endpoint) == wire
-    ]
-    if len(matches) == 1:
-        return wire
-    if len(matches) > 1:
-        raise _RejectedRequest(
-            f"model {model!r} matches multiple launch declarations for the "
-            + f"{endpoint.value} endpoint"
-        )
-    raise _RejectedRequest(
-        f"model {model!r} is not one the launch declared for this phase "
-        + f"({sorted(policy.allowed_models)})"
-    )
 
 
 def _model_name(json_data: dict[str, pydantic.JsonValue]) -> str | None:
@@ -1118,10 +1097,7 @@ def _normalize_responses(body: dict[str, pydantic.JsonValue]) -> None:
 
 
 def _normalize_google(body: dict[str, pydantic.JsonValue]) -> None:
-    """Validate the URL-path model identifier, then remove it from the body."""
-    model = body.get("model")
-    if not isinstance(model, str) or not _MODEL_NAME_RE.fullmatch(model):
-        raise _RejectedRequest(f"model name {model!r} is not a valid model id")
+    """Remove the Gemini URL-path model identifier from the forwarded body."""
     body.pop("model", None)
 
 

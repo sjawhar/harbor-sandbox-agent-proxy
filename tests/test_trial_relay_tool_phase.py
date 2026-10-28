@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import httpx
 import inspect_ai.agent
+import inspect_ai.event
 import inspect_ai.tool
 import pydantic
 import pytest
@@ -24,30 +25,31 @@ from harbor_sandbox_agent_proxy._inspect_compat import (
     call_tool,
     list_tools,
 )
-from harbor_sandbox_agent_proxy.collaborators import (
-    BridgedMcpServer,
-    RequestDialect,
-    UpstreamTarget,
-)
+from harbor_sandbox_agent_proxy.connection import AgentConnection
 from harbor_sandbox_agent_proxy.config import RelayConfig
-from harbor_sandbox_agent_proxy.outcome import (
-    EventSink,
-    RelayOutcome,
-    TrialEvent,
-    TrialIdentity,
-)
+from harbor_sandbox_agent_proxy.model_events import RELAY_METADATA_KEY
+from harbor_sandbox_agent_proxy.outcome import EventSink, RelayOutcome, TrialIdentity
 from harbor_sandbox_agent_proxy.proxy import _register_bridged_tool_specs
 from harbor_sandbox_agent_proxy.relay import RelayCall, relay_methods
+from harbor_sandbox_agent_proxy.routing import (
+    ModelCall,
+    RequestDialect,
+    Route,
+    auth_headers,
+    match_declared,
+)
+from harbor_sandbox_agent_proxy.task_metadata import BridgedMcpServer
 from harbor_sandbox_agent_proxy.trial_relay import TrialRelay, phase_guarded_tool
 
 _SERVER = "task-tools"
 _TOOL = "ping"
 _ARGUMENTS: dict[str, pydantic.JsonValue] = {"text": "hello"}
-_REFUSAL_DATA: dict[str, pydantic.JsonValue] = {
-    "server": _SERVER,
-    "tool": _TOOL,
-    "arguments": _ARGUMENTS,
-    "reason": "outside the agent's turn",
+_REFUSAL_METADATA = {
+    RELAY_METADATA_KEY: {
+        "phase": "verifier",
+        "server": _SERVER,
+        "refused": "outside the agent's turn",
+    }
 }
 
 
@@ -78,23 +80,29 @@ def ping(ran: list[str]) -> inspect_ai.tool.Tool:
 
 class _Sink(EventSink):
     def __init__(self) -> None:
-        self.events: list[TrialEvent] = []
+        self.events: list[inspect_ai.event.Event] = []
         self.outcome: RelayOutcome | None = None
 
-    async def record(self, event: TrialEvent) -> None:
+    async def record(self, event: inspect_ai.event.Event) -> None:
         self.events.append(event)
 
     async def close(self, outcome: RelayOutcome) -> None:
         self.outcome = outcome
 
 
-class _Upstream:
-    async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget:
-        del dialect, model
-        return UpstreamTarget(
-            "https://upstream.test/v1/messages", {"x-api-key": "host-key"}
-        )
+_CONNECTION = AgentConnection(
+    "anthropic",
+    ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    ("ANTHROPIC_BASE_URL",),
+)
 
+
+async def _route(call: ModelCall) -> Route:
+    return Route(
+        "https://upstream.test",
+        auth_headers(call.api, "host-key"),
+        match_declared(call),
+    )
 
 def _bridge(specs: Sequence[inspect_ai.agent.BridgedToolsSpec]) -> SandboxAgentBridge:
     bridge = SandboxAgentBridge(
@@ -134,7 +142,7 @@ def _grant(
 class _Harness:
     relay: TrialRelay
     bridge: SandboxAgentBridge
-    sink_events: list[TrialEvent]
+    sink_events: list[inspect_ai.event.Event]
     ran: list[str]
     failures: list[Exception]
     require_proposal: bool
@@ -202,14 +210,15 @@ async def _opened(
     relay_instance = TrialRelay(
         trial=TrialIdentity(name="example__1", directory=Path("/tmp/example__1")),
         config=_settings(),
-        upstream=_Upstream(),
+        route=_route,
         sink=sink,
+        connection=_CONNECTION,
         environment=cast(BaseEnvironment, object()),
         bridged_servers=(
             BridgedMcpServer(
                 name=_SERVER,
                 command="python3",
-                args=("/opt/task_tools.py",),
+                args=["/opt/task_tools.py"],
                 require_proposal=require_proposal,
             ),
         ),
@@ -229,30 +238,32 @@ async def _opened(
             require_proposal=require_proposal,
         )
     finally:
-        if sink.outcome is None:
-            _ = await relay_instance.close()
+        _ = await relay_instance.close()
 
 
-def _refusals(harness: _Harness) -> list[TrialEvent]:
+def _refusals(harness: _Harness) -> list[inspect_ai.event.ToolEvent]:
     assert harness.sink_events == harness.relay.events
-    refusals: list[TrialEvent] = []
+    refusals: list[inspect_ai.event.ToolEvent] = []
     for event in harness.relay.events:
-        if event.kind != "refused-tool-call":
-            continue
-        assert event.phase == "verifier"
-        assert event.data == _REFUSAL_DATA
+        assert isinstance(event, inspect_ai.event.ToolEvent)
+        assert event.function == _TOOL
+        assert event.arguments == _ARGUMENTS
+        assert event.result == ""
+        assert event.pending is False
+        assert event.completed is not None
+        assert event.error is not None
+        assert event.error.type == "permission"
+        assert f"{_SERVER}/{_TOOL}" in event.error.message
+        assert event.metadata == _REFUSAL_METADATA
         refusals.append(event)
     return refusals
 
 
-_LIFECYCLE_KINDS = frozenset(
-    {"caller-key-minted", "agent-opened", "verifier-opened", "agent-resumed", "closed"}
-)
-
-
-def _non_lifecycle(events: Sequence[TrialEvent]) -> list[TrialEvent]:
-    """The events a test's actions caused: every event but the relay's own lifecycle."""
-    return [event for event in events if event.kind not in _LIFECYCLE_KINDS]
+def _phase(event: inspect_ai.event.ToolEvent) -> object:
+    assert event.metadata is not None
+    metadata = event.metadata[RELAY_METADATA_KEY]
+    assert isinstance(metadata, dict)
+    return metadata["phase"]
 
 
 async def test_a_claude_code_trials_granted_call_is_refused_outside_the_agents_turn(
@@ -261,8 +272,6 @@ async def test_a_claude_code_trials_granted_call_is_refused_outside_the_agents_t
     async with _opened(monkeypatch, require_proposal=True) as harness:
         _grant(harness.bridge, _ARGUMENTS)
         await harness.relay.end_agent_phase()
-        before = list(harness.relay.events)
-
         with pytest.raises(inspect_ai.tool.ToolError) as refused:
             _ = await call_tool(harness.bridge)(_SERVER, _TOOL, dict(_ARGUMENTS))
 
@@ -274,12 +283,10 @@ async def test_a_claude_code_trials_granted_call_is_refused_outside_the_agents_t
         assert harness.failures == []
         assert harness.ran == []
         (event,) = _refusals(harness)
-        assert harness.relay.events == [*before, event]
+        assert harness.relay.events == [event]
         outcome = await harness.relay.close()
 
-    # hawk: `outcome.events == [event]`. The package also records its own lifecycle
-    # events (key minting, phase changes, close), so every other event must be one of those.
-    assert _non_lifecycle(outcome.events) == [event]
+    assert outcome.events == [event]
     assert outcome.counts == {
         "agent_calls": 0,
         "verifier_calls": 0,
@@ -293,17 +300,11 @@ async def test_a_codex_trials_bare_call_is_served_in_the_agents_turn_and_refused
 ) -> None:
     async with _opened(monkeypatch, require_proposal=False) as harness:
         call = call_tool(harness.bridge)
-        relay_before = list(harness.relay.events)
-        sink_before = list(harness.sink_events)
 
         assert await call(_SERVER, _TOOL, dict(_ARGUMENTS)) == "pong: hello"
         assert harness.ran == ["hello"]
-        # hawk: `harness.relay.events == []` and `harness.sink_events == []` after the
-        # served call: serving it records nothing, here beyond the lifecycle so far.
-        assert harness.relay.events == relay_before
-        assert harness.sink_events == sink_before
-        assert _non_lifecycle(harness.relay.events) == []
-        assert _non_lifecycle(harness.sink_events) == []
+        assert harness.relay.events == []
+        assert harness.sink_events == []
 
         await harness.relay.end_agent_phase()
         with pytest.raises(inspect_ai.tool.ToolError, match="relay phase: verifier"):
@@ -335,7 +336,7 @@ async def test_a_later_steps_agent_turn_is_served_between_two_refusals(
     assert harness.ran == ["hello"]
     assert harness.failures == []
     refusals = _refusals(harness)
-    assert [event.phase for event in refusals] == ["verifier", "verifier"]
+    assert [_phase(event) for event in refusals] == ["verifier", "verifier"]
 
 
 @pytest.mark.parametrize(
@@ -360,7 +361,7 @@ async def test_the_judges_model_calls_are_answered_while_its_tool_calls_are_refu
         await harness.relay.end_agent_phase()
         generate = relay_methods(
             harness.relay.current_policy,
-            harness.relay.upstream,
+            harness.relay.route,
             record=record,
             client=client,
         )["generate_anthropic"]
@@ -379,7 +380,7 @@ async def test_the_judges_model_calls_are_answered_while_its_tool_calls_are_refu
     assert len(_refusals(harness)) == 1
 
 
-async def _never_refused(event: TrialEvent) -> None:
+async def _never_refused(event: inspect_ai.event.ToolEvent) -> None:
     raise AssertionError(f"the agent phase refused a tool call: {event!r}")
 
 

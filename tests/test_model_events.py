@@ -20,7 +20,12 @@ import pydantic
 import pytest
 
 from harbor_sandbox_agent_proxy import model_events, relay
-from harbor_sandbox_agent_proxy.collaborators import DefaultUpstream
+from harbor_sandbox_agent_proxy.routing import (
+    ModelCall,
+    Route,
+    auth_headers,
+    match_declared,
+)
 
 type _Json = dict[str, pydantic.JsonValue]
 
@@ -300,6 +305,13 @@ async def test_an_event_records_the_beta_header_and_the_body_the_forwarder_sent(
     async def record(call: relay.RelayCall) -> None:
         calls.append(call)
 
+    async def route(call: ModelCall) -> Route:
+        return Route(
+            "https://upstream.test",
+            auth_headers(call.api, "launch-token"),
+            match_declared(call),
+        )
+
     policy = relay.RelayPolicy(
         caller_key="key",
         allowed_models=frozenset({"claude-x"}),
@@ -314,7 +326,7 @@ async def test_an_event_records_the_beta_header_and_the_body_the_forwarder_sent(
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         methods = relay.relay_methods(
             lambda: ("agent", policy),
-            DefaultUpstream({"ANTHROPIC_API_KEY": "launch-token"}),
+            route,
             record=record,
             client=client,
         )

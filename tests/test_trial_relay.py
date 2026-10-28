@@ -8,7 +8,7 @@ import copy
 import datetime
 import json
 import types
-from collections.abc import AsyncGenerator, Generator, Mapping
+from collections.abc import AsyncGenerator, Callable, Collection, Generator, Mapping
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,47 +21,51 @@ import pydantic
 import pytest
 from harbor.environments.base import BaseEnvironment
 
-from harbor_sandbox_agent_proxy import trial_relay
-from harbor_sandbox_agent_proxy.collaborators import (
-    BridgedMcpServer,
-    RequestDialect,
-    SecretSource,
-    UpstreamTarget,
-)
+from harbor_sandbox_agent_proxy import model_events, trial_relay
+from harbor_sandbox_agent_proxy.connection import AgentConnection, served_connection_env
 from harbor_sandbox_agent_proxy.config import RelayConfig
-from harbor_sandbox_agent_proxy.outcome import (
-    EventSink,
-    RelayOutcome,
-    TrialEvent,
-    TrialIdentity,
-)
+from harbor_sandbox_agent_proxy.outcome import EventSink, RelayOutcome, TrialIdentity
 from harbor_sandbox_agent_proxy.relay import RelayCall, RelayPhase, relay_methods
+from harbor_sandbox_agent_proxy.routing import (
+    ModelCall,
+    RequestDialect,
+    Route,
+    auth_headers,
+    match_declared,
+)
+from harbor_sandbox_agent_proxy.task_metadata import BridgedMcpServer
 from harbor_sandbox_agent_proxy.trial_relay import TrialRelay
 
 
 class _Sink(EventSink):
     def __init__(self) -> None:
-        self.events: list[TrialEvent] = []
+        self.events: list[inspect_ai.event.Event] = []
         self.outcome: RelayOutcome | None = None
 
-    async def record(self, event: TrialEvent) -> None:
+    async def record(self, event: inspect_ai.event.Event) -> None:
         self.events.append(event)
 
     async def close(self, outcome: RelayOutcome) -> None:
         self.outcome = outcome
 
 
-class _Upstream:
-    async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget:
-        del dialect, model
-        return UpstreamTarget(
-            "https://upstream.test/v1/messages", {"x-api-key": "host-key"}
-        )
+_CONNECTION = AgentConnection(
+    "anthropic",
+    ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    ("ANTHROPIC_BASE_URL",),
+)
 
 
-class _Secrets:
-    def protected_values(self) -> frozenset[str]:
-        return frozenset({"host-key"})
+def _protected() -> frozenset[str]:
+    return frozenset({"host-key"})
+
+
+async def _route(call: ModelCall) -> Route:
+    return Route(
+        "https://upstream.test",
+        auth_headers(call.api, "host-key"),
+        match_declared(call),
+    )
 
 
 def _settings(**overrides: object) -> RelayConfig:
@@ -79,21 +83,22 @@ def _relay(
     *,
     settings: RelayConfig | None = None,
     environment: BaseEnvironment | None = None,
-    secrets: SecretSource | None = None,
+    protected: Callable[[], Collection[str]] = _protected,
 ) -> TrialRelay:
     return TrialRelay(
         trial=TrialIdentity(name="example__1", directory=Path("/tmp/example__1")),
         config=settings or _settings(),
-        upstream=_Upstream(),
+        route=_route,
         sink=_Sink(),
-        secrets=secrets,
+        connection=_CONNECTION,
+        protected=protected,
         environment=environment,
         bridged_servers=(
             BridgedMcpServer(
                 name="task-tools",
                 command="python3",
-                args=("/opt/task_tools.py",),
-                exclude_tools=frozenset({"admin"}),
+                args=["/opt/task_tools.py"],
+                exclude_tools=["admin"],
             ),
         ),
     )
@@ -217,16 +222,32 @@ async def test_proxy_readiness_accepts_a_live_route_that_returns_not_found() -> 
     assert "HTTPConnection" in command[-1]
 
 
-def test_the_relay_registers_both_caller_keys_for_redaction() -> None:
-    secrets = _Secrets()
-    relay_instance = _relay(secrets=secrets)
+async def test_the_relay_registers_both_caller_keys_for_redaction() -> None:
+    relay_instance = _relay()
+    agent_env = _CONNECTION.proxy_env(key=relay_instance.agent_key, port=13131)
 
-    assert {
-        relay_instance.agent_key,
-        relay_instance.verifier_key,
-    } <= relay_instance.protected_values()
-    assert relay_instance.agent_key not in secrets.protected_values()
-    assert relay_instance.agent_key != relay_instance.verifier_key
+    assert relay_instance.caller_keys == frozenset(
+        {relay_instance.agent_key, relay_instance.verifier_key}
+    )
+    assert relay_instance.protected_values() == frozenset(
+        {*relay_instance.caller_keys, "host-key"}
+    )
+    assert relay_instance.phase_env() == agent_env
+
+    await relay_instance.end_agent_phase()
+    first_verifier_key = relay_instance.verifier_key
+    await relay_instance.resume_agent_phase()
+    await relay_instance.end_agent_phase()
+
+    expected_verifier_env = {
+        **served_connection_env(key=relay_instance.verifier_key, port=13131),
+        **_CONNECTION.proxy_env(key=relay_instance.verifier_key, port=13131),
+    }
+    assert first_verifier_key in relay_instance.caller_keys
+    assert relay_instance.verifier_key in relay_instance.caller_keys
+    assert relay_instance.phase_env() == expected_verifier_env
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in relay_instance.phase_env()
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in relay_instance.phase_env()
 
 
 async def test_close_does_not_swallow_its_own_cancellation(
@@ -255,6 +276,7 @@ async def test_close_returns_the_outcome_whatever_the_proxy_task_raised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     relay_instance = _relay(environment=MagicMock(spec=BaseEnvironment))
+    assert isinstance(relay_instance.sink, _Sink)
 
     async def hold_then_lose_the_sandbox(
         *, ready: asyncio.Future[None], stop: asyncio.Event
@@ -267,12 +289,11 @@ async def test_close_returns_the_outcome_whatever_the_proxy_task_raised(
     await relay_instance.open_agent_phase()
     first = _model_event([_USER], "first reply")
     await _record_events(monkeypatch, relay_instance, first)
-    recorded = list(relay_instance.events)
 
     outcome = await relay_instance.close()
 
-    assert outcome.events[:-1] == recorded
-    assert outcome.events[-1] == TrialEvent(kind="closed", phase="agent", data={})
+    assert outcome.events == [first]
+    assert relay_instance.sink.outcome is None
     assert outcome.answered_agent_calls == 1
     assert outcome.proxy_exit is not None
     assert outcome.proxy_exit["error"] == "ConnectionError('the sandbox pod is gone')"
@@ -290,8 +311,8 @@ async def test_each_swap_to_the_verifier_mints_a_fresh_key_and_retires_the_last(
 
     second = relay_instance.verifier_key
     assert second != first
-    assert first in relay_instance.protected_values()
-    assert second in relay_instance.protected_values()
+    assert {relay_instance.agent_key, first, second} <= relay_instance.caller_keys
+    assert {first, second} <= relay_instance.protected_values()
     assert relay_instance.phase_env()["ANTHROPIC_API_KEY"] == second
     calls: list[RelayCall] = []
 
@@ -304,7 +325,7 @@ async def test_each_swap_to_the_verifier_mints_a_fresh_key_and_retires_the_last(
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
         generate = relay_methods(
             relay_instance.current_policy,
-            relay_instance.upstream,
+            relay_instance.route,
             record=record,
             client=client,
         )["generate_anthropic"]
@@ -370,7 +391,7 @@ async def test_each_phase_confines_tools_by_its_own_rule(
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
         generate = relay_methods(
             relay_instance.current_policy,
-            relay_instance.upstream,
+            relay_instance.route,
             record=relay_instance.record,
             client=client,
         )["generate_anthropic"]
@@ -418,7 +439,7 @@ async def test_record_failure_is_re_raised_and_preserved_in_the_outcome(
     async def fail_conversion(_call: RelayCall) -> object:
         raise ValueError("cannot convert this call")
 
-    monkeypatch.setattr(trial_relay, "model_event_from_call", fail_conversion)
+    monkeypatch.setattr(model_events, "model_event_from_call", fail_conversion)
     with pytest.raises(ValueError, match="cannot convert this call"):
         await relay_instance.record(_call())
 
@@ -437,7 +458,7 @@ async def test_record_failure_keeps_only_the_first_failure(
     async def fail_conversion(_call: RelayCall) -> object:
         raise next(failures)
 
-    monkeypatch.setattr(trial_relay, "model_event_from_call", fail_conversion)
+    monkeypatch.setattr(model_events, "model_event_from_call", fail_conversion)
     with pytest.raises(ValueError, match="first"):
         await relay_instance.record(_call())
     with pytest.raises(RuntimeError, match="second"):
@@ -480,7 +501,7 @@ async def _record_events(
     async def converted(_call: RelayCall) -> inspect_ai.event.ModelEvent:
         return next(pending)
 
-    monkeypatch.setattr(trial_relay, "model_event_from_call", converted)
+    monkeypatch.setattr(model_events, "model_event_from_call", converted)
     for _ in events:
         await relay_instance.record(_call())
 
@@ -804,8 +825,9 @@ async def test_configured_policy_reaches_the_forwarder(tmp_path: Path) -> None:
             max_calls=1,
             max_recorded_bytes=4_096,
         ),
-        upstream=_Upstream(),
+        route=_route,
         sink=_Sink(),
+        connection=_CONNECTION,
     )
     observed_bodies: list[dict[str, object]] = []
     observed_headers: list[Mapping[str, str]] = []
@@ -817,7 +839,7 @@ async def test_configured_policy_reaches_the_forwarder(tmp_path: Path) -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
         generate = relay_methods(
-            relay.current_policy, relay.upstream, record=relay.record, client=client
+            relay.current_policy, relay.route, record=relay.record, client=client
         )["generate_anthropic"]
         _ = await generate(
             {
@@ -844,8 +866,9 @@ async def test_configured_policy_reaches_the_forwarder(tmp_path: Path) -> None:
         bounded = TrialRelay(
             trial=TrialIdentity(name="bounded", directory=tmp_path),
             config=config,
-            upstream=_Upstream(),
+            route=_route,
             sink=_Sink(),
+            connection=_CONNECTION,
         )
         sent: list[httpx.Request] = []
 
@@ -856,7 +879,7 @@ async def test_configured_policy_reaches_the_forwarder(tmp_path: Path) -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(count)) as client:
             generate = relay_methods(
                 bounded.current_policy,
-                bounded.upstream,
+                bounded.route,
                 record=bounded.record,
                 client=client,
             )["generate_anthropic"]

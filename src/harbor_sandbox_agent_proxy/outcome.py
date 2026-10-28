@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol
 
-import pydantic
+import inspect_ai.event
 
 if TYPE_CHECKING:
     from inspect_ai.model import ChatMessage
@@ -25,15 +25,6 @@ class TrialIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
-class TrialEvent:
-    """A serializable package-owned observation from a trial lifecycle."""
-
-    kind: str
-    phase: str
-    data: Mapping[str, pydantic.JsonValue]
-
-
-@dataclasses.dataclass(frozen=True)
 class RelayOutcome:
     """The complete result of one relay or runner-loop lifecycle.
 
@@ -44,7 +35,7 @@ class RelayOutcome:
 
     mode: Literal["relay", "runner-loop"]
     calls: list[RelayCall]
-    events: list[TrialEvent]
+    events: list[inspect_ai.event.Event]
     conversation: list[ChatMessage] | None
     answered_agent_calls: int
     counts: Mapping[str, int]
@@ -57,18 +48,11 @@ class RelayOutcome:
 
 
 class EventSink(Protocol):
-    """Receive redaction-safe package records for one trial."""
+    """Receive the Inspect events and completed outcome for one trial."""
 
-    async def record(self, event: TrialEvent) -> None: ...
+    async def record(self, event: inspect_ai.event.Event) -> None: ...
 
     async def close(self, outcome: RelayOutcome) -> None: ...
-
-
-@runtime_checkable
-class EventSinkFactory(Protocol):
-    """Open a fresh event sink for each trial."""
-
-    async def open(self, trial: TrialIdentity) -> EventSink: ...
 
 
 @dataclasses.dataclass
@@ -76,11 +60,11 @@ class JsonOutcomeSink:
     """Write a redacted, self-contained package outcome beneath a trial directory."""
 
     trial: TrialIdentity
-    protected_values: Collection[str] = ()
-    _events: list[TrialEvent] = dataclasses.field(default_factory=list)
+    protected: Callable[[], Collection[str]]
 
-    async def record(self, event: TrialEvent) -> None:
-        self._events.append(event)
+    async def record(self, event: inspect_ai.event.Event) -> None:
+        """Accept a live event; the completed outcome supplies the persisted event list."""
+        del event
 
     async def close(self, outcome: RelayOutcome) -> None:
         destination = self.trial.directory / "sandbox-agent-proxy" / "outcome.json"
@@ -89,10 +73,7 @@ class JsonOutcomeSink:
             "trial": self.trial.name,
             "mode": outcome.mode,
             "calls": [call.model_dump(mode="json") for call in outcome.calls],
-            "events": [
-                {"kind": event.kind, "phase": event.phase, "data": dict(event.data)}
-                for event in outcome.events
-            ],
+            "events": [event.model_dump(mode="json") for event in outcome.events],
             "counts": dict(outcome.counts),
             "conversation": (
                 None
@@ -112,7 +93,7 @@ class JsonOutcomeSink:
             "record_error": outcome.record_error,
         }
         destination.write_text(
-            json.dumps(_redact(payload, self.protected_values), sort_keys=True),
+            json.dumps(_redact(payload, self.protected()), sort_keys=True),
             encoding="utf-8",
         )
 
