@@ -336,6 +336,7 @@ class RelayEnvironment(BaseEnvironment):
     _configured_environments: tuple[tuple[str, Mapping[str, str]], ...]
     _tests_mirror: _TestsMirror | None
     _sink: EventSink | None
+    _setup_env: dict[str, str] | None
     relay: _RelayPhase | None
     outcome: RelayOutcome | None
     caller_keys: frozenset[str]
@@ -397,6 +398,7 @@ class RelayEnvironment(BaseEnvironment):
 
         self._tests_mirror = None
         self._sink = None
+        self._setup_env = None
         self.relay = None
         self.outcome = None
         self.caller_keys = frozenset()
@@ -465,6 +467,18 @@ class RelayEnvironment(BaseEnvironment):
         if self._sink is None:
             self._sink = await self.open_event_sink(self.trial)
         return self._sink
+
+    @contextlib.contextmanager
+    def scoped_agent_setup_env(
+        self, environment: Mapping[str, str]
+    ) -> Generator[None, None, None]:
+        """Temporarily supply an installed agent's declared proxy connection."""
+        previous = self._setup_env
+        self._setup_env = dict(environment)
+        try:
+            yield
+        finally:
+            self._setup_env = previous
 
     def attach_relay(self, relay: _RelayPhase) -> None:
         """Associate this trial's installed-agent relay with its environment."""
@@ -822,7 +836,9 @@ class RelayEnvironment(BaseEnvironment):
         self, env: dict[str, str] | None, *, where: str
     ) -> dict[str, str] | None:
         merged = self._merge_env(env) or {}
-        phase_env = {} if self.relay is None else self.relay.phase_env()
+        phase_env = (
+            self.relay.phase_env() if self.relay is not None else self._setup_env or {}
+        )
         managed = MANAGED_PROVIDER_VARIABLES | phase_env.keys()
         merged = {name: value for name, value in merged.items() if name not in managed}
         self._refuse_protected(merged, where=where)

@@ -28,6 +28,7 @@ from harbor_sandbox_agent_proxy.config import RelayConfig
 from harbor_sandbox_agent_proxy.environment import RelayEnvironment
 from harbor_sandbox_agent_proxy.trial_relay import TrialRelay
 from tests.test_relay_environment import _environment as _relay_environment
+from tests.test_relay_environment import _inner
 
 RELAY: dict[str, object] = {
     "polling_interval": 0.25,
@@ -93,6 +94,15 @@ class InstalledAgent(installed_agent_base.BaseInstalledAgent):
     ) -> None:
         del instruction, environment, context
         self.calls.append("load")
+
+
+class SetupExecAgent(InstalledAgent):
+    setup_calls: ClassVar[int] = 0
+
+    @override
+    async def setup(self, environment: environment_base.BaseEnvironment) -> None:
+        type(self).setup_calls += 1
+        _ = await environment.exec("setup")
 
 
 class LoopOptions(agent_options.AgentOptions):
@@ -245,6 +255,7 @@ def relay_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agent, "TrialRelay", FakeTrialRelay)
     FakeTrialRelay.next_record_error = None
     FakeTrialRelay.created = 0
+    SetupExecAgent.setup_calls = 0
 
 
 def _installed_agent_config(
@@ -271,6 +282,37 @@ def _environment(tmp_path: Path) -> RelayEnvironment:
         environment_class=FakeRelayEnvironment,
         relay=RELAY,
     )
+
+
+async def test_installed_agent_setup_receives_declared_proxy_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host_key = "host-key-never-enters-the-sandbox"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", host_key)
+    wrapper = _relay_agent(
+        tmp_path,
+        {
+            "import_path": f"{__name__}:SetupExecAgent",
+            "model_name": "anthropic/claude-test",
+        },
+    )
+    environment = _environment(tmp_path)
+
+    assert environment.relay is None
+    with environment.scoped_exec_env(wrapper.extra_env):
+        await wrapper.setup(environment)
+
+    (setup_call,) = [call for call in _inner().calls if call.name == "exec"]
+    setup_env = setup_call.kwargs["env"]
+    assert isinstance(setup_env, dict)
+    assert setup_env == {
+        "PERSISTENT": "kept",
+        "UNMANAGED": "kept",
+        "ANTHROPIC_API_KEY": wrapper._agent_key,
+        "ANTHROPIC_BASE_URL": "http://localhost:13131",
+    }
+    assert host_key not in setup_env.values()
+    assert environment.relay is None
 
 
 async def test_installed_agent_gets_proxy_environment_and_bridged_servers_only_for_run(

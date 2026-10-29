@@ -161,7 +161,13 @@ class RelayAgent(harbor_agent_base.BaseAgent):
 
     @override
     async def setup(self, environment: harbor_environment_base.BaseEnvironment) -> None:
-        await self._inner.setup(environment)
+        if not isinstance(environment, RelayEnvironment) or self._connection is None:
+            await self._inner.setup(environment)
+            return
+        with environment.scoped_agent_setup_env(
+            self._connection.proxy_env(key=self._agent_key, port=self._config.port)
+        ):
+            await self._inner.setup(environment)
 
     @override
     async def run(
