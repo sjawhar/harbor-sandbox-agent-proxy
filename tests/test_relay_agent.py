@@ -168,6 +168,26 @@ class FailingLoopAgent(LoopAgent):
         raise RuntimeError("the agent's loop failed")
 
 
+class TrackingLoopAgent(LoopAgent):
+    setup_calls: ClassVar[int] = 0
+    run_calls: ClassVar[int] = 0
+
+    @override
+    async def setup(self, environment: environment_base.BaseEnvironment) -> None:
+        del environment
+        type(self).setup_calls += 1
+
+    @override
+    async def run(
+        self,
+        instruction: str,
+        environment: environment_base.BaseEnvironment,
+        context: agent_context.AgentContext,
+    ) -> None:
+        del instruction, environment, context
+        type(self).run_calls += 1
+
+
 class LoopWithoutApiBase(agent_base.BaseAgent):
     @staticmethod
     @override
@@ -256,6 +276,8 @@ def relay_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeTrialRelay.next_record_error = None
     FakeTrialRelay.created = 0
     SetupExecAgent.setup_calls = 0
+    TrackingLoopAgent.setup_calls = 0
+    TrackingLoopAgent.run_calls = 0
 
 
 def _installed_agent_config(
@@ -313,6 +335,29 @@ async def test_installed_agent_setup_receives_declared_proxy_connection(
     }
     assert host_key not in setup_env.values()
     assert environment.relay is None
+
+
+async def test_wrapper_environment_is_required_before_setup_or_runner_loop_work(
+    tmp_path: Path,
+) -> None:
+    wrapper = _relay_agent(
+        tmp_path,
+        {"import_path": f"{__name__}:TrackingLoopAgent"},
+    )
+    _ = _environment(tmp_path)
+    plain_environment = _inner()
+
+    with pytest.raises(RuntimeError, match="use both wrapper classes"):
+        await wrapper.setup(plain_environment)
+    with pytest.raises(RuntimeError, match="use both wrapper classes"):
+        await wrapper.run(
+            "do work",
+            plain_environment,
+            agent_context.AgentContext(),
+        )
+
+    assert TrackingLoopAgent.setup_calls == 0
+    assert TrackingLoopAgent.run_calls == 0
 
 
 async def test_installed_agent_gets_proxy_environment_and_bridged_servers_only_for_run(

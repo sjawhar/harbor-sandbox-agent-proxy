@@ -161,7 +161,8 @@ class RelayAgent(harbor_agent_base.BaseAgent):
 
     @override
     async def setup(self, environment: harbor_environment_base.BaseEnvironment) -> None:
-        if not isinstance(environment, RelayEnvironment) or self._connection is None:
+        environment = _relay_environment(environment)
+        if self._connection is None:
             await self._inner.setup(environment)
             return
         with environment.scoped_agent_setup_env(
@@ -209,6 +210,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         environment: harbor_environment_base.BaseEnvironment,
         context: harbor_agent_context.AgentContext,
     ) -> None:
+        environment = _relay_environment(environment)
         if self._installed:
             await self._relayed_phase(phase, instruction, environment, context)
             return
@@ -225,10 +227,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         environment: harbor_environment_base.BaseEnvironment,
         context: harbor_agent_context.AgentContext,
     ) -> None:
-        if not isinstance(environment, RelayEnvironment):
-            raise RuntimeError(
-                "the relay environment wrapper is not in place; use both wrapper classes"
-            )
+        environment = _relay_environment(environment)
         relay = environment.relay
         if relay is None:
             relay = await self._open_relay(environment)
@@ -254,10 +253,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         self, environment: harbor_environment_base.BaseEnvironment
     ) -> TrialRelay:
         """Start the per-trial relay on the first installed-agent phase."""
-        if not isinstance(environment, RelayEnvironment):
-            raise RuntimeError(
-                "the relay environment wrapper is not in place; use both wrapper classes"
-            )
+        environment = _relay_environment(environment)
         if self._connection is None:
             raise RuntimeError("only installed agents open a sandbox relay")
         sink = await environment.open_sink()
@@ -287,10 +283,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
     async def _save_runner_trajectory(
         self, environment: harbor_environment_base.BaseEnvironment
     ) -> None:
-        if not isinstance(environment, RelayEnvironment):
-            raise RuntimeError(
-                "the relay environment wrapper is not in place; use both wrapper classes"
-            )
+        environment = _relay_environment(environment)
         source = self.logs_dir / "trajectory.json"
         target = self.logs_dir.parent / "sandbox-agent-proxy" / "trajectory.json"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -322,6 +315,16 @@ class RelayAgent(harbor_agent_base.BaseAgent):
                 record_error=None,
             )
         )
+
+
+def _relay_environment(
+    environment: harbor_environment_base.BaseEnvironment,
+) -> RelayEnvironment:
+    if not isinstance(environment, RelayEnvironment):
+        raise RuntimeError(
+            "the relay environment wrapper is not in place; use both wrapper classes"
+        )
+    return environment
 
 
 _OBJECT_MAPPING: Final[pydantic.TypeAdapter[dict[str, object]]] = pydantic.TypeAdapter(
