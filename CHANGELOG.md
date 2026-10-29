@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Records each installed agent caller key before setup and preserves it through relay shutdown so host redaction covers setup-only trials.
+
 ## 0.1.1
 
 - The wheel ships a `py.typed` marker, so type checkers read the package's own annotations instead of reporting missing stubs.
