@@ -212,6 +212,7 @@ class MessagesAgent(_E2EAgent):
 class ResponsesAgent(_E2EAgent):
     """A Codex-shaped agent that uses the Responses API and MCP tool names."""
 
+    MODEL_CONNECTION = ModelConnectionSpec(default_provider="openai")
     dialect = "responses"
 
     @staticmethod

@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Self, override
 
@@ -196,7 +197,7 @@ def _response_for(path: str, body: dict[str, object]) -> dict[str, object]:
     raise AssertionError(f"unexpected upstream path {path}")
 
 
-def _task(tmp_path: Path) -> Path:
+def _task(tmp_path: Path, *, host: str) -> Path:
     task = tmp_path / "task"
     environment = task / "environment"
     tests = task / "tests"
@@ -233,17 +234,23 @@ if __name__ == "__main__":
         encoding="utf-8",
     )
     (task / "instruction.md").write_text("Use the tool.\n", encoding="utf-8")
-    (task / "task.toml").write_text(
-        """\
-schema_version = "1.4"
-
-[agent]
-user = 1000
+    metadata = (
+        """
 
 [metadata.sandbox_agent_proxy]
 bridged_mcp_servers = [
   { name = "e2e-tools", command = "python3", args = ["/opt/e2e_tools.py"], require_proposal = false }
 ]
+"""
+        if host == "default"
+        else ""
+    )
+    (task / "task.toml").write_text(
+        f"""\
+schema_version = "1.4"
+
+[agent]
+user = 1000{metadata}
 """,
         encoding="utf-8",
     )
@@ -342,8 +349,19 @@ printf '{"reward": 1}' >/logs/verifier/reward.json
     return task
 
 
-def _job(task: Path, *, agent: str, model: str) -> dict[str, object]:
+def _capture_rows(path: Path) -> Iterator[dict[str, object]]:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        value = json.loads(line)
+        assert isinstance(value, dict)
+        yield value
+
+
+def _job(task: Path, *, host: str, agent: str, model: str) -> dict[str, object]:
     relay = {"declared_models": [model, "anthropic/test-messages"]}
+    environment_import_path = {
+        "default": "harbor_sandbox_agent_proxy.environment:RelayEnvironment",
+        "subclass": "harbor_sandbox_agent_proxy.testing.host:E2EHostEnvironment",
+    }[host]
     return {
         "job_name": "sandbox-agent-proxy-e2e",
         "jobs_dir": str(task.parent / "jobs"),
@@ -357,7 +375,7 @@ def _job(task: Path, *, agent: str, model: str) -> dict[str, object]:
             }
         ],
         "environment": {
-            "import_path": "harbor_sandbox_agent_proxy.environment:RelayEnvironment",
+            "import_path": environment_import_path,
             "kwargs": {
                 "environment": {
                     "import_path": "harbor.environments.docker.docker:DockerEnvironment"
@@ -373,20 +391,47 @@ def _job(task: Path, *, agent: str, model: str) -> dict[str, object]:
 
 @pytest.mark.e2e
 @pytest.mark.docker
+@pytest.mark.parametrize("host", ["default", "subclass"])
 @pytest.mark.parametrize(
-    ("agent", "model"),
-    [pytest.param("MessagesAgent", "anthropic/test-messages")],
+    ("agent", "model", "dialect"),
+    [
+        pytest.param("MessagesAgent", "anthropic/test-messages", "messages"),
+        pytest.param("ResponsesAgent", "openai/test-responses", "responses"),
+    ],
 )
 def test_stock_harbor_relays_model_calls_without_exposing_host_key(
-    tmp_path: Path, agent: str, model: str
+    tmp_path: Path, host: str, agent: str, model: str, dialect: str
 ) -> None:
     skip_if_no_docker()
-    task = _task(tmp_path)
-    job = _job(task, agent=agent, model=model)
+    task = _task(tmp_path, host=host)
+    capture = tmp_path / "upstream.jsonl"
+    job = _job(task, host=host, agent=agent, model=model)
     config = tmp_path / "job.json"
     config.write_text(json.dumps(job), encoding="utf-8")
 
+    expected_paths = (
+        ["/v1/messages"] * 3
+        if dialect == "messages"
+        else ["/responses", "/responses", "/v1/messages"]
+    )
+    expected_headers = (
+        [{"x-api-key": HOST_KEY}] * 3
+        if dialect == "messages"
+        else [
+            {"authorization": f"Bearer {HOST_KEY}"},
+            {"authorization": f"Bearer {HOST_KEY}"},
+            {"x-api-key": HOST_KEY},
+        ]
+    )
     with _FakeUpstreamServer() as upstream:
+        subclass_env = (
+            {
+                "SANDBOX_AGENT_PROXY_E2E_UPSTREAM_URL": upstream.url,
+                "SANDBOX_AGENT_PROXY_E2E_UPSTREAM_CAPTURE": str(capture),
+            }
+            if host == "subclass"
+            else {}
+        )
         result = subprocess.run(
             [
                 "harbor",
@@ -404,7 +449,8 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
                 "ANTHROPIC_BASE_URL": upstream.url,
                 "OPENAI_API_KEY": HOST_KEY,
                 "OPENAI_BASE_URL": upstream.url,
-            },
+            }
+            | subclass_env,
             capture_output=True,
             text=True,
             check=False,
@@ -412,10 +458,32 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
         )
 
     assert result.returncode == 0, result.stderr
-    assert [path for path, _, _ in upstream.requests] == ["/v1/messages"] * 3
-    assert [headers["x-api-key"] for _, headers, _ in upstream.requests] == [
-        HOST_KEY
-    ] * 3
+    assert [path for path, _, _ in upstream.requests] == expected_paths
+    assert [
+        {
+            key: value
+            for key, value in headers.items()
+            if key in {"authorization", "x-api-key"}
+        }
+        for _, headers, _ in upstream.requests
+    ] == expected_headers
+    if host == "subclass":
+        rows = list(_capture_rows(capture))
+        assert [row["dialect"] for row in rows] == [dialect, dialect, "messages"]
+        assert [row["headers"] for row in rows] == expected_headers
+
+    if dialect == "responses":
+        response_requests = [
+            body for path, _, body in upstream.requests if path == "/responses"
+        ]
+        assert len(response_requests) == 2
+        for request in response_requests:
+            tools = request["tools"]
+            assert isinstance(tools, list)
+            assert {"type": "tool_search", "execution": "client"} in tools
+            [namespace] = [tool for tool in tools if tool["type"] == "namespace"]
+            assert namespace["name"] == "mcp__e2e_tools"
+            assert [tool["name"] for tool in namespace["tools"]] == ["echo"]
 
     [outcome] = (tmp_path / "jobs").glob("**/sandbox-agent-proxy/outcome.json")
     payload = json.loads(outcome.read_text(encoding="utf-8"))
@@ -441,6 +509,17 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
         if event["event"] == "model"
     ] == ["agent", "agent", "verifier"]
     assert HOST_KEY not in outcome.read_text(encoding="utf-8")
+
+    if host == "subclass":
+        [events] = (tmp_path / "jobs").glob("**/e2e-host/events.jsonl")
+        assert [event["event"] for event in _capture_rows(events)] == [
+            "model",
+            "tool",
+            "model",
+            "model",
+            "tool",
+        ]
+        assert HOST_KEY not in events.read_text(encoding="utf-8")
 
     [sandbox_environment] = (tmp_path / "jobs").glob("**/agent/environment.json")
     assert HOST_KEY not in sandbox_environment.read_text(encoding="utf-8")
