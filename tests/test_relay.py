@@ -106,13 +106,20 @@ class _Recorder:
         return self._responder(request)
 
 
-def _route(
-    token: Callable[[], str], *, base: str = "https://gw.test/anthropic"
-) -> RouteCall:
+def _route(token: Callable[[], str]) -> RouteCall:
     """Return a host-owned route that admits the launch's declared model."""
 
+    bases = {
+        RequestDialect.MESSAGES: "https://gw.test/anthropic",
+        RequestDialect.CHAT_COMPLETIONS: "https://gw.test/openai/v1",
+        RequestDialect.RESPONSES: "https://gw.test/openai/v1",
+        RequestDialect.GEMINI: "https://gw.test/google-ai",
+    }
+
     async def route(call: ModelCall) -> Route:
-        return Route(base, auth_headers(call.api, token()), match_declared(call))
+        return Route(
+            bases[call.api], auth_headers(call.api, token()), match_declared(call)
+        )
 
     return route
 
@@ -299,7 +306,7 @@ async def test_openai_completions_uses_bearer_and_chat_completions_path() -> Non
     )
 
     request = outcome.recorder.requests[0]
-    assert str(request.url) == "https://gw.test/anthropic/chat/completions"
+    assert str(request.url) == "https://gw.test/openai/v1/chat/completions"
     assert request.headers["authorization"] == "Bearer launch-token"
     assert "authorization" not in outcome.calls[0].headers
 
@@ -312,7 +319,7 @@ async def test_openai_responses_uses_responses_path() -> None:
     )
 
     assert (
-        str(outcome.recorder.requests[0].url) == "https://gw.test/anthropic/responses"
+        str(outcome.recorder.requests[0].url) == "https://gw.test/openai/v1/responses"
     )
 
 
@@ -369,7 +376,7 @@ async def test_google_strips_injected_model_and_always_streams_upstream() -> Non
     request = outcome.recorder.requests[0]
     assert (
         str(request.url)
-        == "https://gw.test/anthropic/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse"
+        == "https://gw.test/google-ai/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse"
     )
     assert request.headers["x-goog-api-key"] == "launch-token"
     assert (
@@ -1523,19 +1530,19 @@ async def test_a_provider_qualified_wire_model_is_refused_even_when_declared() -
             "generate_completions",
             "openai/gpt",
             "gpt",
-            "https://gw.test/anthropic/chat/completions",
+            "https://gw.test/openai/v1/chat/completions",
         ),
         (
             "generate_responses",
             "openai/gpt",
             "gpt",
-            "https://gw.test/anthropic/responses",
+            "https://gw.test/openai/v1/responses",
         ),
         (
             "generate_google",
             "google/gemini-2.0",
             "gemini-2.0",
-            "https://gw.test/anthropic/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse",
+            "https://gw.test/google-ai/v1beta/models/gemini-2.0:streamGenerateContent?alt=sse",
         ),
     ],
 )

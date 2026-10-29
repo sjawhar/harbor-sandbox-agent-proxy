@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass(frozen=True)
 class TrialIdentity:
-    """The trial identity known to package collaborators."""
+    """The trial identity known to package event sinks."""
 
     name: str
     directory: Path

@@ -1,27 +1,16 @@
-"""Small Harbor agents and collaborators used by the package Docker end-to-end test."""
+"""Small Harbor agents used by the package Docker end-to-end test."""
 
 from __future__ import annotations
 
-import json
-import os
 import shlex
-from collections.abc import Collection, Sequence
-from pathlib import Path
 from typing import Final, override
 
 from harbor.agents.installed.base import BaseInstalledAgent
+from harbor.agents.model_connection import ModelConnectionSpec
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from ..collaborators import (
-    BridgedMcpServer,
-    RequestDialect,
-    UpstreamTarget,
-)
-
 HOST_KEY: Final = "host-key-not-for-sandbox"
-_UPSTREAM_URL_ENV: Final = "SANDBOX_AGENT_PROXY_E2E_UPSTREAM_URL"
-_UPSTREAM_CAPTURE_ENV: Final = "SANDBOX_AGENT_PROXY_E2E_UPSTREAM_CAPTURE"
 _MCP_URL: Final = "http://localhost:13131/mcp/e2e-tools"
 
 _AGENT_PROGRAM: Final = r"""
@@ -207,6 +196,11 @@ class _E2EAgent(BaseInstalledAgent):
 class MessagesAgent(_E2EAgent):
     """A Claude Code-shaped agent that uses the Messages API and MCP tool names."""
 
+    MODEL_CONNECTION = ModelConnectionSpec(
+        default_provider="anthropic",
+        api_key_envs=("ANTHROPIC_API_KEY",),
+        base_url_envs=("ANTHROPIC_BASE_URL",),
+    )
     dialect = "messages"
 
     @staticmethod
@@ -224,48 +218,3 @@ class ResponsesAgent(_E2EAgent):
     @override
     def name() -> str:
         return "sandbox-agent-proxy-e2e-responses"
-
-
-class FakeUpstream:
-    """A host-only upstream collaborator that records each relayed request."""
-
-    async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget:
-        capture = Path(os.environ[_UPSTREAM_CAPTURE_ENV])
-        with capture.open("a", encoding="utf-8") as destination:
-            _ = destination.write(
-                json.dumps(
-                    {
-                        "dialect": dialect,
-                        "headers": {"x-api-key": HOST_KEY},
-                        "model": model,
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-        return UpstreamTarget(
-            url=f"{os.environ[_UPSTREAM_URL_ENV]}/{dialect}",
-            headers={"x-api-key": HOST_KEY},
-        )
-
-
-class FakeSecretSource:
-    """Redact the fixed host key used by ``FakeUpstream``."""
-
-    def protected_values(self) -> Collection[str]:
-        return frozenset({HOST_KEY})
-
-
-class E2EBridgedToolServerProvider:
-    """Provide one task-local MCP tool server for the Docker regression test."""
-
-    async def servers_for(self, trial_name: str) -> Sequence[BridgedMcpServer]:
-        del trial_name
-        return (
-            BridgedMcpServer(
-                name="e2e-tools",
-                command="python3",
-                args=("/opt/e2e_tools.py",),
-                require_proposal=False,
-            ),
-        )

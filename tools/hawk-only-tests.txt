@@ -1,1 +1,14 @@
-# Test names listed here are intentionally absent from the package parity suite.
+# Test names listed here intentionally move to hawk in T8.
+test_a_vertex_declared_model_uses_the_vertex_gateway_for_qualified_and_bare_wire_names  # hawk/tests/runner/harbor/test_relay_host.py
+test_the_gateway_is_the_runners_hawk_environment_and_its_token_is_read_per_call  # hawk/tests/runner/harbor/test_relay_host.py
+test_a_provider_base_url_in_the_environment_never_receives_the_launch_token  # hawk/tests/runner/harbor/test_relay_host.py
+test_a_runner_without_the_gateway_or_its_token_is_refused_before_any_call  # hawk/tests/runner/harbor/test_relay_host.py
+test_a_provider_hawk_does_not_route_has_no_base_url  # hawk/tests/runner/harbor/test_relay_host.py
+test_the_anthropic_stream_tests_run_on_an_sdk_the_harbor_runner_installs  # hawk/tests/runner/harbor/test_relay_host.py
+test_runner_loop_agent_gets_gateway_api_base_and_preserves_host_trajectory  # hawk/tests/runner/test_run_harbor_job.py
+test_runner_loop_agent_without_api_base_is_refused_when_it_names_a_model  # hawk/tests/runner/test_run_harbor_job.py
+test_runner_loop_agent_without_model_does_not_need_an_api_base  # hawk/tests/runner/test_run_harbor_job.py
+test_a_model_free_runner_loop_agent_needs_no_llm_proxy  # hawk/tests/runner/test_run_harbor_job.py
+test_preflight_refuses_an_agent_that_calls_a_model_with_no_llm_proxy  # hawk/tests/runner/test_run_harbor_job.py
+test_preflight_refuses_a_runner_loop_agent_hawk_cannot_route  # hawk/tests/runner/test_run_harbor_job.py
+test_a_wrapped_agents_caller_key_is_registered_for_redaction  # hawk/tests/runner/harbor/test_relay_host.py

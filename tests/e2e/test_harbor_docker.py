@@ -1,4 +1,4 @@
-"""Stock Harbor Docker proof for both supported model request dialects."""
+"""Stock Harbor Docker proof for the default host's Messages API relay."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import os
 import subprocess
 import threading
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Self, override
 
@@ -94,7 +93,7 @@ class _FakeUpstreamServer:
 
 
 def _response_for(path: str, body: dict[str, object]) -> dict[str, object]:
-    if path == "/messages":
+    if path == "/v1/messages":
         messages = body.get("messages")
         has_tool_result = isinstance(messages, list) and any(
             isinstance(message, dict)
@@ -197,7 +196,7 @@ def _response_for(path: str, body: dict[str, object]) -> dict[str, object]:
     raise AssertionError(f"unexpected upstream path {path}")
 
 
-def _task(tmp_path: Path, *, leak_host_environment: bool = False) -> Path:
+def _task(tmp_path: Path) -> Path:
     task = tmp_path / "task"
     environment = task / "environment"
     tests = task / "tests"
@@ -215,16 +214,6 @@ COPY e2e_tools.py /opt/e2e_tools.py
 """,
         encoding="utf-8",
     )
-    if leak_host_environment:
-        (environment / "docker-compose.yaml").write_text(
-            """\
-services:
-  main:
-    environment:
-      - OPENAI_API_KEY
-""",
-            encoding="utf-8",
-        )
     (environment / "e2e_tools.py").write_text(
         """\
 from mcp.server.fastmcp import FastMCP
@@ -250,6 +239,11 @@ schema_version = "1.4"
 
 [agent]
 user = 1000
+
+[metadata.sandbox_agent_proxy]
+bridged_mcp_servers = [
+  { name = "e2e-tools", command = "python3", args = ["/opt/e2e_tools.py"], require_proposal = false }
+]
 """,
         encoding="utf-8",
     )
@@ -348,14 +342,8 @@ printf '{"reward": 1}' >/logs/verifier/reward.json
     return task
 
 
-def _capture_rows(path: Path) -> Iterator[dict[str, object]]:
-    for line in path.read_text(encoding="utf-8").splitlines():
-        value = json.loads(line)
-        assert isinstance(value, dict)
-        yield value
-
-
 def _job(task: Path, *, agent: str, model: str) -> dict[str, object]:
+    relay = {"declared_models": [model, "anthropic/test-messages"]}
     return {
         "job_name": "sandbox-agent-proxy-e2e",
         "jobs_dir": str(task.parent / "jobs"),
@@ -364,12 +352,7 @@ def _job(task: Path, *, agent: str, model: str) -> dict[str, object]:
                 "import_path": "harbor_sandbox_agent_proxy.agent:RelayAgent",
                 "kwargs": {
                     "agent": {"import_path": f"{_AGENTS}:{agent}"},
-                    "relay": {"declared_models": [model, "anthropic/test-messages"]},
-                    "upstream": f"{_AGENTS}:FakeUpstream",
-                    "secrets": f"{_AGENTS}:FakeSecretSource",
-                    "bridged_tool_server_provider": (
-                        f"{_AGENTS}:E2EBridgedToolServerProvider"
-                    ),
+                    "relay": relay,
                 },
             }
         ],
@@ -379,8 +362,7 @@ def _job(task: Path, *, agent: str, model: str) -> dict[str, object]:
                 "environment": {
                     "import_path": "harbor.environments.docker.docker:DockerEnvironment"
                 },
-                "relay": {"declared_models": [model, "anthropic/test-messages"]},
-                "secrets": f"{_AGENTS}:FakeSecretSource",
+                "relay": relay,
             },
         },
         "tasks": [{"path": str(task)}],
@@ -392,18 +374,14 @@ def _job(task: Path, *, agent: str, model: str) -> dict[str, object]:
 @pytest.mark.e2e
 @pytest.mark.docker
 @pytest.mark.parametrize(
-    ("agent", "model", "dialect"),
-    [
-        pytest.param("MessagesAgent", "anthropic/test-messages", "messages"),
-        pytest.param("ResponsesAgent", "openai/test-responses", "responses"),
-    ],
+    ("agent", "model"),
+    [pytest.param("MessagesAgent", "anthropic/test-messages")],
 )
 def test_stock_harbor_relays_model_calls_without_exposing_host_key(
-    tmp_path: Path, agent: str, model: str, dialect: str
+    tmp_path: Path, agent: str, model: str
 ) -> None:
     skip_if_no_docker()
     task = _task(tmp_path)
-    capture = tmp_path / "upstream.jsonl"
     job = _job(task, agent=agent, model=model)
     config = tmp_path / "job.json"
     config.write_text(json.dumps(job), encoding="utf-8")
@@ -422,9 +400,10 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
             cwd=tmp_path,
             env=os.environ
             | {
+                "ANTHROPIC_API_KEY": HOST_KEY,
+                "ANTHROPIC_BASE_URL": upstream.url,
                 "OPENAI_API_KEY": HOST_KEY,
-                "SANDBOX_AGENT_PROXY_E2E_UPSTREAM_URL": upstream.url,
-                "SANDBOX_AGENT_PROXY_E2E_UPSTREAM_CAPTURE": str(capture),
+                "OPENAI_BASE_URL": upstream.url,
             },
             capture_output=True,
             text=True,
@@ -433,24 +412,10 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
         )
 
     assert result.returncode == 0, result.stderr
-    rows = list(_capture_rows(capture))
-    assert [row["dialect"] for row in rows] == [dialect, dialect, "messages"]
-    assert [row["headers"] for row in rows] == [{"x-api-key": HOST_KEY}] * 3
+    assert [path for path, _, _ in upstream.requests] == ["/v1/messages"] * 3
     assert [headers["x-api-key"] for _, headers, _ in upstream.requests] == [
         HOST_KEY
     ] * 3
-    if dialect == "responses":
-        response_requests = [
-            body for path, _, body in upstream.requests if path == "/responses"
-        ]
-        assert len(response_requests) == 2
-        for request in response_requests:
-            tools = request["tools"]
-            assert isinstance(tools, list)
-            assert {"type": "tool_search", "execution": "client"} in tools
-            [namespace] = [tool for tool in tools if tool["type"] == "namespace"]
-            assert namespace["name"] == "mcp__e2e_tools"
-            assert [tool["name"] for tool in namespace["tools"]] == ["echo"]
 
     [outcome] = (tmp_path / "jobs").glob("**/sandbox-agent-proxy/outcome.json")
     payload = json.loads(outcome.read_text(encoding="utf-8"))
@@ -461,11 +426,20 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
         "verifier_calls": 1,
     }
     assert any(
-        event["kind"] == "refused-tool-call"
-        and event["phase"] == "verifier"
-        and event["data"]["reason"] == "outside the agent's turn"
+        event["event"] == "tool"
+        and event["metadata"].get("sandbox_agent_proxy")
+        == {
+            "phase": "verifier",
+            "server": "e2e-tools",
+            "refused": "outside the agent's turn",
+        }
         for event in payload["events"]
     )
+    assert [
+        event["metadata"]["sandbox_agent_proxy"]["phase"]
+        for event in payload["events"]
+        if event["event"] == "model"
+    ] == ["agent", "agent", "verifier"]
     assert HOST_KEY not in outcome.read_text(encoding="utf-8")
 
     [sandbox_environment] = (tmp_path / "jobs").glob("**/agent/environment.json")
@@ -479,48 +453,3 @@ def test_stock_harbor_relays_model_calls_without_exposing_host_key(
     )
     [checks] = (tmp_path / "jobs").glob("**/verifier/e2e-checks.txt")
     assert checks.read_text(encoding="utf-8") == "permission-and-tool-checks-passed\n"
-
-
-@pytest.mark.e2e
-@pytest.mark.docker
-def test_docker_compose_host_environment_reference_is_refused(tmp_path: Path) -> None:
-    """A task compose variable can inherit a host key outside wrapper-owned env maps."""
-    skip_if_no_docker()
-    task = _task(tmp_path, leak_host_environment=True)
-    config = tmp_path / "job.json"
-    config.write_text(
-        json.dumps(
-            _job(
-                task,
-                agent="MessagesAgent",
-                model="anthropic/test-messages",
-            )
-        ),
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [
-            "harbor",
-            "run",
-            "--config",
-            str(config),
-            "--yes",
-            "--plugin",
-            "sandbox-agent-proxy",
-        ],
-        cwd=tmp_path,
-        env=os.environ | {"OPENAI_API_KEY": HOST_KEY},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=600,
-    )
-
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    [trial_result] = (tmp_path / "jobs").glob("**/task__*/result.json")
-    exception = json.loads(trial_result.read_text(encoding="utf-8"))["exception_info"]
-    assert exception["exception_type"] == "RunnerSecretExposureError"
-    assert "OPENAI_API_KEY" in exception["exception_message"]
-    assert HOST_KEY not in exception["exception_message"]

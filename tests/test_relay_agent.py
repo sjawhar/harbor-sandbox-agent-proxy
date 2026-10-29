@@ -106,7 +106,7 @@ class SetupExecAgent(InstalledAgent):
 
 
 class LoopOptions(agent_options.AgentOptions):
-    api_base: str | None = None
+    """Runner-loop options used by the package-only relay tests."""
 
 
 class LoopAgent(agent_base.BaseAgent):
@@ -414,8 +414,6 @@ async def test_runner_loop_agent_preserves_host_trajectory_on_the_environment(
     environment = _environment(tmp_path)
     await wrapper.run("do work", environment, agent_context.AgentContext())
     assert LoopAgent.latest is not None
-    assert isinstance(LoopAgent.latest.options, LoopOptions)
-    assert LoopAgent.latest.options.api_base is None
     saved = tmp_path / "sandbox-agent-proxy" / "trajectory.json"
     assert saved.read_text(encoding="utf-8") == "runner trajectory"
     await environment.stop(delete=False)

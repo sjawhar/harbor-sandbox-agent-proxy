@@ -10,12 +10,12 @@ from typing import Final
 import pytest
 
 HARBOR_TEST_MODULES: Final = (
+    "test_connection.py",
+    "test_environment_host.py",
     "test_trial_relay.py",
     "test_trial_relay_tool_phase.py",
     "test_relay_agent.py",
     "test_relay_environment.py",
-    "test_plugin.py",
-    "test_environment.py",
     "test_wrappers.py",
     "e2e",
 )
