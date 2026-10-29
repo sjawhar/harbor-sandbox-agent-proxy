@@ -889,7 +889,7 @@ wheels = [
 
 [[package]]
 name = "harbor-sandbox-agent-proxy"
-version = "0.1.0.dev0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },

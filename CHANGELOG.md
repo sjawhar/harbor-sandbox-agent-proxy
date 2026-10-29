@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- The wheel ships a `py.typed` marker, so type checkers read the package's own annotations instead of reporting missing stubs.
+- `uv.lock` records the package's own version.
+
 ## 0.1.0
 
 - Adds a Harbor relay that keeps model API keys in the host process while an agent runs in a sandbox.
