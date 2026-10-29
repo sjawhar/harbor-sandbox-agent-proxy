@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, Final, Protocol, override, runtime_checkable
+from typing import Any, Final, cast, override
 from uuid import UUID
 
 import anyio
@@ -20,29 +20,12 @@ import harbor.models.trial.config as harbor_trial_config
 import harbor.models.trial.result as harbor_trial_result
 import pydantic
 
-from .collaborators import (
-    BridgedMcpServer,
-    BridgedToolServerProvider,
-    DefaultBridgedToolServerProvider,
-    DefaultSecretSource,
-    DefaultUpstream,
-    SecretSource,
-    Upstream,
-)
-from .collaborators import (
-    RequestDialect as LegacyRequestDialect,
-)
 from .config import RelayConfig
 from .connection import AgentConnection, agent_connection
-from .outcome import EventSink, JsonOutcomeSink, RelayOutcome, TrialIdentity
-from .registry import resolve_collaborator
+from .environment import RelayEnvironment
+from .outcome import RelayOutcome
 from .relay import mint_caller_key
-from .routing import ModelCall, Route, RouteCall, endpoint_url, match_declared
-from .task_metadata import BridgedMcpServer as TaskBridgedMcpServer
 from .trial_relay import TrialRelay
-
-RUNNER_LOOP_OUTCOMES: dict[str, RelayOutcome] = {}
-"""Runner-owned trajectories from agents whose model loop stays in the host process."""
 
 type _AgentPhase = Callable[
     [str, harbor_environment_base.BaseEnvironment, harbor_agent_context.AgentContext],
@@ -50,28 +33,15 @@ type _AgentPhase = Callable[
 ]
 
 
-@runtime_checkable
-class EventSinkFactory(Protocol):
-    """Legacy per-trial sink collaborator, pending the RelayEnvironment host seam."""
-
-    async def open(self, trial: TrialIdentity) -> EventSink: ...
-
-
 class RelayAgent(harbor_agent_base.BaseAgent):
     """Wrap a Harbor agent and install the appropriate relay behavior around it."""
 
-    options_model: ClassVar[type[Any] | None] = None
     _config: RelayConfig
     _inner_config: harbor_trial_config.AgentConfig
-    _upstream: Upstream
-    _secrets: SecretSource
-    _connection: AgentConnection
-    _sink_factory: EventSinkFactory | None
-    _bridged_tool_server_provider: BridgedToolServerProvider
+    _connection: AgentConnection | None
     _agent_key: str
     _installed: bool
     _inner: harbor_agent_base.BaseAgent
-    _relay: TrialRelay | None
 
     def __init__(
         self,
@@ -86,10 +56,6 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         environment_logs_dir: PurePosixPath | None = None,
         agent: object,
         relay: object,
-        upstream: object | None = None,
-        secrets: object | None = None,
-        event_sink_factory: object | None = None,
-        bridged_tool_server_provider: object | None = None,
         override_setup_timeout_sec: float | None = None,
         **kwargs: Any,
     ) -> None:
@@ -106,29 +72,20 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         )
         self._config = RelayConfig.model_validate(relay)
         self._inner_config, inner_class = _inner_agent(agent)
-        self._upstream = _upstream(upstream)
-        self._secrets = _secrets(secrets, self._upstream)
-        self._sink_factory = _sink_factory(event_sink_factory)
-        self._bridged_tool_server_provider = _bridged_tool_server_provider(
-            bridged_tool_server_provider
-        )
         vars(self)["capabilities"] = inner_class.capabilities
         self._installed = issubclass(
             inner_class, harbor_installed_agent_base.BaseInstalledAgent
         )
-        self._connection = _connection(inner_class, self._inner_config)
+        self._connection = None
         self._agent_key = mint_caller_key()
         inner_env = {**self.extra_env}
         inner_kwargs: dict[str, Any] = dict(self._inner_config.kwargs)
         if self._installed:
-            inner_env |= _agent_proxy_environment(
-                key=self._agent_key,
-                port=self._config.port,
-                model_name=self._inner_config.model_name,
+            self._connection = agent_connection(
+                inner_class, self._inner_config.model_name
             )
-        elif self._inner_config.model_name is not None:
-            inner_kwargs["api_base"] = runner_loop_api_base(
-                inner_class, self._inner_config, self._upstream
+            inner_env |= self._connection.proxy_env(
+                key=self._agent_key, port=self._config.port
             )
         if override_setup_timeout_sec is not None:
             inner_kwargs["override_setup_timeout_sec"] = override_setup_timeout_sec
@@ -149,7 +106,6 @@ class RelayAgent(harbor_agent_base.BaseAgent):
             if value is not None
         }
         self._inner = inner_class(**{**inner_kwargs, **framework})
-        self._relay = None
         self._session_id: str | None = None
         self._context_id: UUID | None = None
 
@@ -169,15 +125,8 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         options = dict(kwargs or {})
         inner_config, inner_class = _inner_agent(options.get("agent"))
         _ = RelayConfig.model_validate(options.get("relay"))
-        if _calls_a_model(inner_class, inner_config):
-            if not issubclass(
-                inner_class, harbor_installed_agent_base.BaseInstalledAgent
-            ):
-                runner_loop_api_base(
-                    inner_class,
-                    inner_config,
-                    _upstream(options.get("upstream")),
-                )
+        if issubclass(inner_class, harbor_installed_agent_base.BaseInstalledAgent):
+            _ = agent_connection(inner_class, inner_config.model_name)
         inner_class.preflight(kwargs=inner_config.kwargs, env=env)
 
     @override
@@ -270,10 +219,15 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         environment: harbor_environment_base.BaseEnvironment,
         context: harbor_agent_context.AgentContext,
     ) -> None:
-        relay = self._relay
+        if not isinstance(environment, RelayEnvironment):
+            raise RuntimeError(
+                "the relay environment wrapper is not in place; use both wrapper classes"
+            )
+        relay = environment.relay
         if relay is None:
             relay = await self._open_relay(environment)
         else:
+            relay = cast(TrialRelay, relay)
             await relay.resume_agent_phase()
             self._inner._extra_env.update(relay.phase_env())
         inner_error: BaseException | None = None
@@ -294,34 +248,26 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         self, environment: harbor_environment_base.BaseEnvironment
     ) -> TrialRelay:
         """Start the per-trial relay on the first installed-agent phase."""
-        attach = getattr(environment, "attach_relay", None)
-        trial_paths = getattr(environment, "trial_paths", None)
-        if attach is None or trial_paths is None:
+        if not isinstance(environment, RelayEnvironment):
             raise RuntimeError(
                 "the relay environment wrapper is not in place; use both wrapper classes"
             )
-        identity = TrialIdentity(
-            name=trial_paths.trial_dir.name, directory=trial_paths.trial_dir
-        )
-        sink = (
-            JsonOutcomeSink(identity, protected=self._secrets.protected_values)
-            if self._sink_factory is None
-            else await self._sink_factory.open(identity)
-        )
+        if self._connection is None:
+            raise RuntimeError("only installed agents open a sandbox relay")
+        sink = await environment.open_sink()
+        servers = await environment.bridged_tool_servers()
         relay = TrialRelay(
-            trial=identity,
+            trial=environment.trial,
             config=self._config,
-            route=_upstream_route(self._upstream),
+            route=environment.route,
             sink=sink,
             connection=self._connection,
-            bridged_servers=_bridged_servers(
-                await self._bridged_tool_server_provider.servers_for(identity.name)
-            ),
-            protected=self._secrets.protected_values,
+            bridged_servers=servers,
+            protected=environment.protected_values,
             environment=environment,
             agent_key=self._agent_key,
         )
-        attach(relay)
+        environment.attach_relay(relay)
         try:
             await relay.open_agent_phase()
         except BaseException:
@@ -330,13 +276,15 @@ class RelayAgent(harbor_agent_base.BaseAgent):
             raise
         self._inner.mcp_servers.extend(relay.mcp_server_configs())
         self._inner._extra_env.update(relay.phase_env())
-        self._relay = relay
         return relay
 
     async def _save_runner_trajectory(
         self, environment: harbor_environment_base.BaseEnvironment
     ) -> None:
-        trial_name = environment.trial_paths.trial_dir.name
+        if not isinstance(environment, RelayEnvironment):
+            raise RuntimeError(
+                "the relay environment wrapper is not in place; use both wrapper classes"
+            )
         source = self.logs_dir / "trajectory.json"
         target = self.logs_dir.parent / "sandbox-agent-proxy" / "trajectory.json"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -347,130 +295,27 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         else:
             runner_atif = None
             runner_atif_sha256 = None
-        RUNNER_LOOP_OUTCOMES[trial_name] = RelayOutcome(
-            mode="runner-loop",
-            calls=[],
-            events=[],
-            conversation=None,
-            answered_agent_calls=0,
-            counts={
-                "agent_calls": 0,
-                "verifier_calls": 0,
-                "failed_calls": 0,
-                "refused_calls": 0,
-            },
-            dropped_betas=frozenset(),
-            refusal_reason=None,
-            proxy_exit=None,
-            runner_atif=runner_atif,
-            runner_atif_sha256=runner_atif_sha256,
-            record_error=None,
-        )
-
-
-def _upstream(value: object | None) -> Upstream:
-    candidate = (
-        DefaultUpstream()
-        if value is None
-        else resolve_collaborator(value, label="upstream")
-    )
-    if not isinstance(candidate, Upstream):
-        raise TypeError("upstream must implement resolve")
-    return candidate
-
-
-def _secrets(value: object | None, upstream: Upstream) -> SecretSource:
-    candidate = (
-        DefaultSecretSource(upstream.environment)
-        if value is None and isinstance(upstream, DefaultUpstream)
-        else value
-    )
-    if candidate is None:
-        raise ValueError("a non-default upstream requires a secrets collaborator")
-    resolved = resolve_collaborator(candidate, label="secrets")
-    if not isinstance(resolved, SecretSource):
-        raise TypeError("secrets must implement protected_values")
-    return resolved
-
-
-def _sink_factory(value: object | None) -> EventSinkFactory | None:
-    if value is None:
-        return None
-    candidate = resolve_collaborator(value, label="event_sink_factory")
-    if not isinstance(candidate, EventSinkFactory):
-        raise TypeError("event_sink_factory must implement open")
-    return candidate
-
-
-def _connection(
-    agent_class: type[harbor_agent_base.BaseAgent],
-    config: harbor_trial_config.AgentConfig,
-) -> AgentConnection:
-    """Adapt legacy wrapper agents until RelayEnvironment owns the host connection."""
-    try:
-        return agent_connection(agent_class, config.model_name)
-    except ValueError:
-        return AgentConnection(
-            "anthropic",
-            ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
-            ("ANTHROPIC_BASE_URL",),
-        )
-
-
-def _upstream_route(upstream: Upstream) -> RouteCall:
-    """Adapt the legacy endpoint-valued upstream collaborator to the route seam."""
-
-    async def route(call: ModelCall) -> Route:
-        model = match_declared(call)
-        target = await upstream.resolve(
-            dialect=LegacyRequestDialect(call.api.value),
-            model=model,
-        )
-        suffix = endpoint_url("", call.api, model)
-        if not target.url.endswith(suffix):
-            raise RuntimeError(
-                f"upstream URL {target.url!r} does not end with the {call.api.value!r} endpoint"
+        environment.record_runner_loop_outcome(
+            RelayOutcome(
+                mode="runner-loop",
+                calls=[],
+                events=[],
+                conversation=None,
+                answered_agent_calls=0,
+                counts={
+                    "agent_calls": 0,
+                    "verifier_calls": 0,
+                    "failed_calls": 0,
+                    "refused_calls": 0,
+                },
+                dropped_betas=frozenset(),
+                refusal_reason=None,
+                proxy_exit=None,
+                runner_atif=runner_atif,
+                runner_atif_sha256=runner_atif_sha256,
+                record_error=None,
             )
-        return Route(target.url.removesuffix(suffix), target.headers, model)
-
-    return route
-
-
-def _bridged_servers(
-    servers: Sequence[BridgedMcpServer],
-) -> tuple[TaskBridgedMcpServer, ...]:
-    """Adapt legacy collaborator records until task metadata owns bridged servers."""
-    return tuple(
-        TaskBridgedMcpServer(
-            name=server.name,
-            command=server.command,
-            args=list(server.args),
-            exclude_tools=list(server.exclude_tools),
-            require_proposal=server.require_proposal,
         )
-        for server in servers
-    )
-
-
-def _bridged_tool_server_provider(value: object | None) -> BridgedToolServerProvider:
-    candidate = (
-        DefaultBridgedToolServerProvider()
-        if value is None
-        else resolve_collaborator(value, label="bridged_tool_server_provider")
-    )
-    if not isinstance(candidate, BridgedToolServerProvider):
-        raise TypeError("bridged_tool_server_provider must implement servers_for")
-    return candidate
-
-
-def _calls_a_model(
-    agent_class: type[harbor_agent_base.BaseAgent],
-    config: harbor_trial_config.AgentConfig,
-) -> bool:
-    return (
-        issubclass(agent_class, harbor_installed_agent_base.BaseInstalledAgent)
-        or config.model_name is not None
-    )
 
 
 _OBJECT_MAPPING: Final[pydantic.TypeAdapter[dict[str, object]]] = pydantic.TypeAdapter(
@@ -495,55 +340,6 @@ def _inner_agent(
     except TypeError as error:
         raise ValueError(str(error)) from error
     return config, agent_class
-
-
-def runner_loop_api_base(
-    agent_class: type[harbor_agent_base.BaseAgent],
-    config: harbor_trial_config.AgentConfig,
-    upstream: Upstream,
-) -> str:
-    """Resolve the host-side API base for a runner-loop agent's model calls."""
-    model_name = config.model_name
-    if model_name is None:
-        raise ValueError(f"{agent_class.name()} names no model for its API base")
-    options = agent_class.options_model
-    if options is None or "api_base" not in options.model_fields:
-        raise ValueError(
-            f"{agent_class.name()} names model {model_name} but has no api_base option"
-        )
-    resolver = getattr(upstream, "api_base", None)
-    if not callable(resolver):
-        raise ValueError(
-            f"{agent_class.name()} needs an upstream collaborator with api_base(model=...)"
-        )
-    base = resolver(model=model_name)
-    if not isinstance(base, str) or not base:
-        raise ValueError(
-            f"{agent_class.name()} received no API base for model {model_name}"
-        )
-    return base
-
-
-def _agent_proxy_environment(
-    *, key: str, port: int, model_name: str | None
-) -> dict[str, str]:
-    environment = {
-        "ANTHROPIC_API_KEY": key,
-        "ANTHROPIC_AUTH_TOKEN": key,
-        "ANTHROPIC_BASE_URL": f"http://localhost:{port}",
-        "OPENAI_API_KEY": key,
-        "OPENAI_BASE_URL": f"http://localhost:{port}/v1",
-        "OPENAI_API_BASE": f"http://localhost:{port}/v1",
-        "GEMINI_API_KEY": key,
-        "GOOGLE_API_KEY": key,
-        "GOOGLE_GENERATIVE_AI_API_KEY": key,
-        "GOOGLE_GEMINI_BASE_URL": f"http://localhost:{port}",
-    }
-    if model_name is not None:
-        model = model_name.partition("/")[2] or model_name
-        environment["ANTHROPIC_SMALL_FAST_MODEL"] = model
-        environment["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
-    return environment
 
 
 def _sha256(path: Path) -> str:

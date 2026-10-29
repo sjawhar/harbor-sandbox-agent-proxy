@@ -13,9 +13,9 @@ import stat
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path, PurePosixPath
-from typing import ClassVar, Literal, override
+from typing import Any, ClassVar, Literal, override
 
 import harbor.environments.base as harbor_environment_base
 import harbor.environments.capabilities as harbor_capabilities
@@ -37,13 +37,6 @@ from harbor_sandbox_agent_proxy.outcome import (
     RelayOutcome,
     TrialIdentity,
 )
-
-
-@pytest.fixture(autouse=True)
-def fresh_environments() -> Iterator[None]:
-    relay_environment.ENVIRONMENTS.clear()
-    yield
-    relay_environment.ENVIRONMENTS.clear()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -323,19 +316,26 @@ class FakeTrialRelay:
             "OPENAI_BASE_URL": "http://localhost:13131/v1",
         }
 
-    def protected_values(self) -> tuple[()]:
-        return ()
+    @property
+    def caller_keys(self) -> frozenset[str]:
+        return frozenset({"agent-caller-key", "verifier-caller-key"})
 
     async def close(self) -> RelayOutcome:
         return _empty_relay_outcome()
 
 
-@dataclasses.dataclass(frozen=True)
-class FakeSecretSource:
-    values: frozenset[str]
+class ProtectedRelayEnvironment(RelayEnvironment):
+    def __init__(
+        self,
+        *args: Any,
+        protected: Collection[str],
+        **kwargs: Any,
+    ) -> None:
+        self._test_protected_values = frozenset(protected)
+        super().__init__(*args, **kwargs)
 
-    def protected_values(self) -> frozenset[str]:
-        return self.values
+    def protected_values(self) -> Collection[str]:
+        return self._test_protected_values
 
 
 def _agent_environment_mounts(paths: trial_paths.TrialPaths) -> list[dict[str, str]]:
@@ -368,10 +368,20 @@ def _environment(
     startup_env: dict[str, str] | None = None,
     session_id: str = "trial__env",
     mounts: list[dict[str, str]] | None = None,
-    secrets: object | None = None,
+    protected_values: Collection[str] = (),
+    environment_class: type[RelayEnvironment] = RelayEnvironment,
+    relay: object | None = None,
 ) -> RelayEnvironment:
     paths = trial_paths.TrialPaths(tmp_path / "trial")
-    return RelayEnvironment(
+    wrapper_kwargs: dict[str, Collection[str]] = {}
+    if protected_values:
+        if environment_class is not RelayEnvironment:
+            raise ValueError(
+                "test helpers cannot combine a custom host and protected values"
+            )
+        environment_class = ProtectedRelayEnvironment
+        wrapper_kwargs["protected"] = protected_values
+    return environment_class(
         environment_dir=tmp_path / "environment",
         environment_name="example",
         session_id=session_id,
@@ -381,10 +391,12 @@ def _environment(
             "import_path": f"{__name__}:FakeInner",
             "kwargs": {"startup_env": startup_env or {}},
         },
-        relay={},
+        relay={"declared_models": ["anthropic/claude-test"]}
+        if relay is None
+        else relay,
         persistent_env={"PERSISTENT": "kept"},
         mounts=_agent_environment_mounts(paths) if mounts is None else mounts,
-        secrets=secrets,
+        **wrapper_kwargs,
     )
 
 
@@ -437,6 +449,7 @@ async def test_stopping_a_relay_writes_the_returned_outcome_to_its_sink(
     class OutcomeRelay:
         sink: JsonOutcomeSink
         verifier_conversation: None = None
+        caller_keys: frozenset[str] = frozenset()
 
         def phase_env(self) -> dict[str, str]:
             return {}
@@ -493,11 +506,6 @@ async def test_delegates_environment_methods_and_default_user_to_the_inner_envir
     assert [(call.name, call.args, call.kwargs) for call in calls] == [
         ("_startup_env", (), {}),
         ("start", (True,), {}),
-        (
-            "exec",
-            ("tr '\\000' '\\n' </proc/1/environ; env",),
-            {"cwd": None, "env": None, "timeout_sec": None, "user": "root"},
-        ),
         ("stop", (False,), {}),
         ("upload_file", (tmp_path / "source", "/remote/source"), {}),
         ("upload_dir", (tmp_path / "directory", "/remote/directory"), {}),
@@ -535,7 +543,7 @@ async def test_exec_refuses_a_runner_secret_under_any_environment_name(
     tmp_path: Path, leaked_value: str
 ) -> None:
     environment = _environment(
-        tmp_path, secrets=FakeSecretSource(frozenset({"runner-secret-value-123"}))
+        tmp_path, protected_values=frozenset({"runner-secret-value-123"})
     )
 
     with pytest.raises(RunnerSecretExposureError, match="EXTRA_AUTH") as raised:
@@ -552,7 +560,7 @@ async def test_exec_refuses_a_runner_secret_the_runner_hid_from_its_environment(
     tmp_path: Path,
 ) -> None:
     hidden = "hidden-request-secret-0123"
-    environment = _environment(tmp_path, secrets=FakeSecretSource(frozenset({hidden})))
+    environment = _environment(tmp_path, protected_values=frozenset({hidden}))
 
     with pytest.raises(RunnerSecretExposureError, match="PLAIN") as raised:
         _ = await environment.exec("echo unsafe", env={"PLAIN": f"value {hidden}"})
@@ -568,7 +576,7 @@ async def test_start_refuses_a_runner_secret_hidden_in_the_provider_startup_envi
     environment = _environment(
         tmp_path,
         startup_env={"EXTRA_AUTH": f"Bearer {runner_secret}"},
-        secrets=FakeSecretSource(frozenset({runner_secret})),
+        protected_values=frozenset({runner_secret}),
     )
 
     with pytest.raises(RunnerSecretExposureError, match="EXTRA_AUTH") as raised:
@@ -919,7 +927,7 @@ def _host_environment(
                 "on_upload": on_upload,
             },
         },
-        relay={},
+        relay={"declared_models": ["anthropic/claude-test"]},
         mounts=_agent_environment_mounts(paths),
     )
     environment.default_user = os.getuid()
@@ -1798,7 +1806,7 @@ async def test_delegates_service_operations_and_streams_inner_output(
 
 async def test_service_exec_refuses_a_runner_secret(tmp_path: Path) -> None:
     secret = "runner-secret-value-123"
-    environment = _environment(tmp_path, secrets=FakeSecretSource(frozenset({secret})))
+    environment = _environment(tmp_path, protected_values=frozenset({secret}))
 
     with pytest.raises(RunnerSecretExposureError, match="EXTRA_AUTH") as raised:
         _ = await environment.service_exec(
@@ -1818,21 +1826,19 @@ def test_managed_provider_variables_include_vertex_credentials() -> None:
 def test_the_trials_environment_is_registered_when_its_relay_attaches(
     tmp_path: Path,
 ) -> None:
-    """The trial's END finds the environment holding the relay, by trial name."""
     environment = _environment(tmp_path)
-    assert "trial" not in relay_environment.ENVIRONMENTS
+    relay = FakeTrialRelay()
 
-    environment.attach_relay(FakeTrialRelay())
-
-    assert relay_environment.ENVIRONMENTS == {"trial": environment}
+    assert environment.relay is None
+    environment.attach_relay(relay)
+    assert environment.relay is relay
 
 
 def test_a_separate_verifier_environment_is_refused_naming_the_mode(
     tmp_path: Path,
 ) -> None:
     """Harbor builds a separate verifier environment from the same wrapped block and
-    the same trial paths; it refuses to start, before any provider is built, and
-    leaves the trial's own environment, holding the relay, registered."""
+    the same trial paths; it refuses to start before any provider is built."""
     environment = _environment(tmp_path)
     environment.attach_relay(FakeTrialRelay())
     provider = _inner()
@@ -1848,7 +1854,7 @@ def test_a_separate_verifier_environment_is_refused_naming_the_mode(
         )
 
     assert _inner() is provider
-    assert relay_environment.ENVIRONMENTS == {"trial": environment}
+    assert environment.relay is not None
 
 
 _SEPARATE_VERIFIER_PROBE = """

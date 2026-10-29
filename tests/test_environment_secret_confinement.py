@@ -20,7 +20,6 @@ class RecordingEnvironment(BaseEnvironment):
     """Inner environment that exposes the configuration and sandbox env it sees."""
 
     latest: ClassVar[RecordingEnvironment | None] = None
-    reported_environment: ClassVar[str] = ""
 
     def __init__(
         self,
@@ -45,7 +44,6 @@ class RecordingEnvironment(BaseEnvironment):
         self.received_task_env = dict(task_env_config.env)
         self.received_persistent_env = persistent_env
         self.seen_startup: dict[str, str] | None = None
-        self.stopped_with: bool | None = None
         super().__init__(
             environment_dir,
             environment_name,
@@ -72,7 +70,7 @@ class RecordingEnvironment(BaseEnvironment):
 
     @override
     async def stop(self, delete: bool) -> None:
-        self.stopped_with = delete
+        del delete
 
     @override
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
@@ -100,7 +98,7 @@ class RecordingEnvironment(BaseEnvironment):
         user: str | int | None = None,
     ) -> ExecResult:
         del command, cwd, env, timeout_sec, user
-        return ExecResult(return_code=0, stdout=type(self).reported_environment)
+        return ExecResult(return_code=0)
 
 
 def _environment(
@@ -159,22 +157,3 @@ async def test_persistent_env_is_resolved_then_refused_before_start(
         await environment.start(False)
 
     assert host_key not in str(error.value)
-
-
-async def test_started_sandbox_with_protected_value_is_stopped_and_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    host_key = "host-key-not-for-sandbox"
-    monkeypatch.setenv("OPENAI_API_KEY", host_key)
-    RecordingEnvironment.reported_environment = f"UNRELATED_NAME={host_key}"
-    environment = _environment(tmp_path)
-
-    try:
-        with pytest.raises(RunnerSecretExposureError, match="UNRELATED_NAME") as error:
-            await environment.start(False)
-    finally:
-        RecordingEnvironment.reported_environment = ""
-
-    assert host_key not in str(error.value)
-    assert RecordingEnvironment.latest is not None
-    assert RecordingEnvironment.latest.stopped_with is True

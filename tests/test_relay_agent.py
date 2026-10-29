@@ -9,24 +9,25 @@ import operator
 import types
 from collections.abc import AsyncGenerator, Callable, Generator
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, cast, override
+from typing import Any, ClassVar, override
 from uuid import uuid4
 
 import harbor.agents.base as agent_base
 import harbor.agents.capabilities as agent_capabilities
 import harbor.agents.installed.base as installed_agent_base
+import harbor.agents.model_connection as model_connection
 import harbor.agents.options as agent_options
 import harbor.environments.base as environment_base
 import harbor.models.agent.context as agent_context
 import harbor.models.task.config as task_config
-import harbor.models.trial.paths as trial_paths
 import pydantic
 import pytest
 
 from harbor_sandbox_agent_proxy import agent, trial_relay
-from harbor_sandbox_agent_proxy.collaborators import RequestDialect, UpstreamTarget
 from harbor_sandbox_agent_proxy.config import RelayConfig
+from harbor_sandbox_agent_proxy.environment import RelayEnvironment
 from harbor_sandbox_agent_proxy.trial_relay import TrialRelay
+from tests.test_relay_environment import _environment as _relay_environment
 
 RELAY: dict[str, object] = {
     "polling_interval": 0.25,
@@ -36,26 +37,12 @@ RELAY: dict[str, object] = {
 RESUMABLE = agent_capabilities.AgentCapabilities(resume=True, load_atif_trajectory=True)
 
 
-class _Upstream:
-    async def resolve(self, *, dialect: RequestDialect, model: str) -> UpstreamTarget:
-        del dialect, model
-        return UpstreamTarget(
-            "https://upstream.test/v1/messages", {"x-api-key": "host-key"}
-        )
-
-    def api_base(self, *, model: str) -> str:
-        assert model == "anthropic/claude-test"
-        return "https://upstream.test/anthropic"
-
-
-class _Secrets:
-    def protected_values(self) -> frozenset[str]:
-        return frozenset({"host-key"})
-
-
 class InstalledAgent(installed_agent_base.BaseInstalledAgent):
     latest: ClassVar[InstalledAgent | None] = None
     capabilities: ClassVar[agent_capabilities.AgentCapabilities] = RESUMABLE
+    MODEL_CONNECTION: ClassVar[model_connection.ModelConnectionSpec] = (
+        model_connection.ModelConnectionSpec(default_provider="anthropic")
+    )
     seen_mcp_servers: list[task_config.MCPServerConfig]
     calls: list[str]
     setup_timeout_sec: object
@@ -203,18 +190,6 @@ class PlainAgent(LoopWithoutApiBase):
         PlainAgent.latest = self
 
 
-class FakeRelayEnvironment:
-    trial_paths: trial_paths.TrialPaths
-    attached: FakeTrialRelay | None
-
-    def __init__(self, trial_dir: Path) -> None:
-        self.trial_paths = trial_paths.TrialPaths(trial_dir)
-        self.attached = None
-
-    def attach_relay(self, relay: FakeTrialRelay) -> None:
-        self.attached = relay
-
-
 class FakeTrialRelay:
     latest: ClassVar[FakeTrialRelay | None] = None
     next_record_error: ClassVar[Exception | None] = None
@@ -260,10 +235,14 @@ class FakeTrialRelay:
         self.ended += 1
 
 
+class FakeRelayEnvironment(RelayEnvironment):
+    async def bridged_tool_servers(self) -> tuple[()]:
+        return ()
+
+
 @pytest.fixture(autouse=True)
 def relay_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agent, "TrialRelay", FakeTrialRelay)
-    monkeypatch.setattr(agent, "RUNNER_LOOP_OUTCOMES", {})
     FakeTrialRelay.next_record_error = None
     FakeTrialRelay.created = 0
 
@@ -281,17 +260,16 @@ def _relay_agent(
         logs_dir=tmp_path / "logs",
         agent=wrapped,
         relay=RELAY,
-        upstream=_Upstream(),
-        secrets=_Secrets(),
         extra_env={"UNMANAGED": "kept", "ANTHROPIC_API_KEY": "untrusted-job-key"},
         **kwargs,
     )
 
 
-def _environment(tmp_path: Path) -> environment_base.BaseEnvironment:
-    return cast(
-        environment_base.BaseEnvironment,
-        cast(object, FakeRelayEnvironment(tmp_path / "trial")),
+def _environment(tmp_path: Path) -> RelayEnvironment:
+    return _relay_environment(
+        tmp_path,
+        environment_class=FakeRelayEnvironment,
+        relay=RELAY,
     )
 
 
@@ -301,21 +279,21 @@ async def test_installed_agent_gets_proxy_environment_and_bridged_servers_only_f
     wrapper = _relay_agent(tmp_path, _installed_agent_config())
     assert InstalledAgent.latest is not None
     inner = InstalledAgent.latest
-    assert inner.extra_env["UNMANAGED"] == "kept"
-    assert inner.extra_env["ANTHROPIC_API_KEY"] != "untrusted-job-key"
-    assert inner.extra_env["ANTHROPIC_BASE_URL"] == "http://localhost:13131"
-    assert inner.extra_env["ANTHROPIC_SMALL_FAST_MODEL"] == "claude-test"
+    assert inner.extra_env == {
+        "UNMANAGED": "kept",
+        "ANTHROPIC_API_KEY": wrapper._agent_key,
+        "ANTHROPIC_BASE_URL": "http://localhost:13131",
+    }
+    assert "ANTHROPIC_SMALL_FAST_MODEL" not in inner.extra_env
+    assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in inner.extra_env
     assert inner.mcp_servers == []
-    environment = FakeRelayEnvironment(tmp_path / "trial")
-    await wrapper.run(
-        "do work",
-        cast(environment_base.BaseEnvironment, cast(object, environment)),
-        agent_context.AgentContext(),
-    )
-    assert environment.attached is FakeTrialRelay.latest
+    environment = _environment(tmp_path)
+    await wrapper.run("do work", environment, agent_context.AgentContext())
+    assert environment.relay is FakeTrialRelay.latest
     assert FakeTrialRelay.latest is not None and FakeTrialRelay.latest.opened
     assert FakeTrialRelay.latest.ended
     assert FakeTrialRelay.latest.agent_key == inner.extra_env["ANTHROPIC_API_KEY"]
+    assert FakeTrialRelay.latest.kwargs["bridged_servers"] == ()
     assert [(server.name, server.url) for server in inner.seen_mcp_servers] == [
         ("task-tools", "http://localhost:13131/mcp/task-tools")
     ]
@@ -339,43 +317,26 @@ def test_installed_agent_without_model_has_no_small_fast_alias(tmp_path: Path) -
     assert "ANTHROPIC_SMALL_FAST_MODEL" not in InstalledAgent.latest.extra_env
 
 
-async def test_runner_loop_agent_gets_gateway_api_base_and_preserves_host_trajectory(
+async def test_runner_loop_agent_preserves_host_trajectory_on_the_environment(
     tmp_path: Path,
 ) -> None:
     wrapper = _relay_agent(
         tmp_path,
         {"import_path": f"{__name__}:LoopAgent", "model_name": "anthropic/claude-test"},
     )
-    await wrapper.run("do work", _environment(tmp_path), agent_context.AgentContext())
+    environment = _environment(tmp_path)
+    await wrapper.run("do work", environment, agent_context.AgentContext())
     assert LoopAgent.latest is not None
     assert isinstance(LoopAgent.latest.options, LoopOptions)
-    assert LoopAgent.latest.options.api_base == "https://upstream.test/anthropic"
+    assert LoopAgent.latest.options.api_base is None
     saved = tmp_path / "sandbox-agent-proxy" / "trajectory.json"
     assert saved.read_text(encoding="utf-8") == "runner trajectory"
-    outcome = agent.RUNNER_LOOP_OUTCOMES["trial"]
+    await environment.stop(delete=False)
+    outcome = environment.outcome
+    assert outcome is not None
     assert outcome.mode == "runner-loop"
     assert outcome.runner_atif == saved
     assert outcome.runner_atif_sha256 is not None
-
-
-def test_runner_loop_agent_without_api_base_is_refused_when_it_names_a_model(
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(ValueError, match="anthropic/claude-test"):
-        _relay_agent(
-            tmp_path,
-            {
-                "import_path": f"{__name__}:LoopWithoutApiBase",
-                "model_name": "anthropic/claude-test",
-            },
-        )
-
-
-def test_runner_loop_agent_without_model_does_not_need_an_api_base(
-    tmp_path: Path,
-) -> None:
-    wrapper = _relay_agent(tmp_path, {"import_path": f"{__name__}:LoopWithoutApiBase"})
-    assert wrapper.version() == "test"
 
 
 async def test_the_jobs_relay_settings_reach_the_trial_relay_typed(
@@ -428,43 +389,6 @@ def test_the_setup_timeout_override_reaches_the_inner_agent(tmp_path: Path) -> N
     assert InstalledAgent.latest.setup_timeout_sec == 900.0
 
 
-async def test_a_wrapped_agents_caller_key_is_registered_for_redaction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def adapter(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        return object()
-
-    @contextlib.contextmanager
-    def bind(environment: object) -> Generator[object]:
-        yield environment
-
-    @contextlib.asynccontextmanager
-    async def proxy(sandbox: object, **kwargs: object) -> AsyncGenerator[object]:
-        del sandbox, kwargs
-        yield types.SimpleNamespace(port=13131)
-
-    async def answered(sandbox: object, *, port: int) -> None:
-        del sandbox, port
-
-    monkeypatch.setattr(agent, "TrialRelay", TrialRelay)
-    monkeypatch.setattr(trial_relay, "HarborSandboxEnvironment", adapter)
-    monkeypatch.setattr(trial_relay, "bind_sandbox_environment", bind)
-    monkeypatch.setattr(trial_relay, "sandbox_model_proxy", proxy)
-    monkeypatch.setattr(trial_relay, "_wait_for_proxy", answered)
-    wrapper = _relay_agent(tmp_path, _installed_agent_config())
-    await wrapper.run("do work", _environment(tmp_path), agent_context.AgentContext())
-
-    assert InstalledAgent.latest is not None
-    key = InstalledAgent.latest.extra_env["ANTHROPIC_API_KEY"]
-    assert key == wrapper._agent_key
-    relay = wrapper._relay
-    assert relay is not None
-    assert key in relay.protected_values()
-    assert key not in _Secrets().protected_values()
-    _ = await relay.close()
-
-
 def test_a_wrapped_agent_declares_its_inner_agents_capabilities(tmp_path: Path) -> None:
     installed = _relay_agent(tmp_path, _installed_agent_config())
     loop = _relay_agent(
@@ -481,14 +405,14 @@ async def test_resume_and_load_run_through_the_relay(
     tmp_path: Path, method: str
 ) -> None:
     wrapper = _relay_agent(tmp_path, _installed_agent_config())
-    environment = FakeRelayEnvironment(tmp_path / "trial")
+    environment = _environment(tmp_path)
     await getattr(wrapper, method)(
         "do work",
-        cast(environment_base.BaseEnvironment, cast(object, environment)),
+        environment,
         agent_context.AgentContext(),
     )
     relay = FakeTrialRelay.latest
-    assert relay is not None and environment.attached is relay
+    assert relay is not None and environment.relay is relay
     assert (relay.opened, relay.ended) == (1, 1)
     assert InstalledAgent.latest is not None
     assert InstalledAgent.latest.calls == [method]
@@ -570,12 +494,13 @@ async def test_a_runner_loop_resume_keeps_the_host_trajectory(tmp_path: Path) ->
         tmp_path,
         {"import_path": f"{__name__}:LoopAgent", "model_name": "anthropic/claude-test"},
     )
-    await wrapper.resume(
-        "do work", _environment(tmp_path), agent_context.AgentContext()
-    )
+    environment = _environment(tmp_path)
+    await wrapper.resume("do work", environment, agent_context.AgentContext())
     saved = tmp_path / "sandbox-agent-proxy" / "trajectory.json"
     assert saved.read_text(encoding="utf-8") == "resumed trajectory"
-    assert agent.RUNNER_LOOP_OUTCOMES["trial"].runner_atif == saved
+    await environment.stop(delete=False)
+    assert environment.outcome is not None
+    assert environment.outcome.runner_atif == saved
 
 
 def test_preflight_checks_the_inner_agents_options() -> None:
@@ -613,73 +538,6 @@ def test_preflight_refuses_a_wrapper_it_cannot_build(
         agent.RelayAgent.preflight(kwargs, {})
 
 
-def test_a_model_free_runner_loop_agent_needs_no_llm_proxy(tmp_path: Path) -> None:
-    loop: dict[str, object] = {"import_path": f"{__name__}:LoopWithoutApiBase"}
-    agent.RelayAgent.preflight({"agent": loop, "relay": RELAY}, {})
-    wrapper = _relay_agent(tmp_path, loop)
-    assert wrapper.version() == "test"
-
-
-@pytest.mark.parametrize(
-    "wrapped",
-    [
-        _installed_agent_config(model_name=None),
-        {"import_path": f"{__name__}:LoopAgent", "model_name": "anthropic/claude-test"},
-    ],
-)
-def test_preflight_refuses_an_agent_that_calls_a_model_with_no_llm_proxy(
-    wrapped: dict[str, object],
-) -> None:
-    agent.RelayAgent.preflight({"agent": wrapped, "relay": RELAY}, {})
-
-    class NoApiBaseUpstream:
-        async def resolve(
-            self, *, dialect: RequestDialect, model: str
-        ) -> UpstreamTarget:
-            del dialect, model
-            return UpstreamTarget("https://upstream.test", {})
-
-    with pytest.raises(ValueError, match="api_base"):
-        agent.RelayAgent.preflight(
-            {
-                "agent": {
-                    "import_path": f"{__name__}:LoopAgent",
-                    "model_name": "anthropic/claude-test",
-                },
-                "relay": RELAY,
-                "upstream": NoApiBaseUpstream(),
-            },
-            {},
-        )
-
-
-def test_preflight_refuses_a_runner_loop_agent_hawk_cannot_route() -> None:
-    class NoApiBaseUpstream:
-        async def resolve(
-            self, *, dialect: RequestDialect, model: str
-        ) -> UpstreamTarget:
-            del dialect, model
-            return UpstreamTarget("https://upstream.test", {})
-
-    config = agent.harbor_trial_config.AgentConfig.model_validate(
-        {"import_path": f"{__name__}:LoopAgent", "model_name": "claude-test"}
-    )
-    with pytest.raises(ValueError, match="api_base"):
-        _ = agent.runner_loop_api_base(LoopAgent, config, NoApiBaseUpstream())
-    with pytest.raises(ValueError, match="api_base"):
-        agent.RelayAgent.preflight(
-            {
-                "agent": {
-                    "import_path": f"{__name__}:LoopAgent",
-                    "model_name": "claude-test",
-                },
-                "relay": RELAY,
-                "upstream": NoApiBaseUpstream(),
-            },
-            {},
-        )
-
-
 @pytest.mark.parametrize(
     "wrapped",
     [
@@ -697,8 +555,6 @@ def test_the_inner_agent_gets_the_jobs_agent_env_as_harbor_resolved_it(
         logs_dir=tmp_path / "logs",
         agent=wrapped,
         relay=RELAY,
-        upstream=_Upstream(),
-        secrets=_Secrets(),
         extra_env={"TEMPLATED": "${UNSET_TEMPLATE}"},
     )
     import_path = wrapped["import_path"]
@@ -720,14 +576,15 @@ async def test_a_failed_runner_loop_phase_keeps_its_trajectory(tmp_path: Path) -
             "model_name": "anthropic/claude-test",
         },
     )
+    environment = _environment(tmp_path)
     with pytest.raises(RuntimeError, match="the agent's loop failed"):
-        await wrapper.run(
-            "do work", _environment(tmp_path), agent_context.AgentContext()
-        )
+        await wrapper.run("do work", environment, agent_context.AgentContext())
     saved = tmp_path / "sandbox-agent-proxy" / "trajectory.json"
     assert saved.read_text(encoding="utf-8") == "partial trajectory"
-    assert agent.RUNNER_LOOP_OUTCOMES["trial"].runner_atif == saved
-    assert agent.RUNNER_LOOP_OUTCOMES["trial"].runner_atif_sha256 is not None
+    await environment.stop(delete=False)
+    assert environment.outcome is not None
+    assert environment.outcome.runner_atif == saved
+    assert environment.outcome.runner_atif_sha256 is not None
 
 
 TRIAL_LOGGER = logging.getLogger("harbor-sandbox-agent-proxy-test-trial")
@@ -799,8 +656,6 @@ def test_the_trials_arguments_win_over_the_inner_agents_own_kwargs(
         logs_dir=tmp_path / "logs",
         agent={"import_path": f"{__name__}:PlainAgent", "kwargs": {argument: own}},
         relay=RELAY,
-        upstream=_Upstream(),
-        secrets=_Secrets(),
         **from_trial,
     )
     assert PlainAgent.latest is not None
@@ -844,8 +699,6 @@ def test_the_inner_agents_own_kwarg_stands_when_the_trial_passes_none(
         logs_dir=tmp_path / "logs",
         agent={"import_path": f"{__name__}:PlainAgent", "kwargs": {argument: own}},
         relay=RELAY,
-        upstream=_Upstream(),
-        secrets=_Secrets(),
     )
     assert PlainAgent.latest is not None
     assert read(PlainAgent.latest) == expected

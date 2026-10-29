@@ -7,7 +7,6 @@ import dataclasses
 import enum
 import json
 import logging
-import os
 import shlex
 import tempfile
 from collections.abc import Collection, Generator, Mapping, Sequence
@@ -28,9 +27,10 @@ from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.utils.env import resolve_env_vars
 from harbor.utils.import_path import import_class
 
-from .collaborators import DefaultSecretSource, SecretSource
-from .outcome import EventSink, RelayOutcome
-from .registry import resolve_collaborator
+from .config import RelayConfig
+from .outcome import EventSink, JsonOutcomeSink, RelayOutcome, TrialIdentity
+from .routing import ModelCall, Route, default_protected_values, default_route
+from .task_metadata import BridgedMcpServer, read_bridged_servers
 
 logger = logging.getLogger(__name__)
 
@@ -41,18 +41,11 @@ _TESTS_MIRROR_PREFIX = _TESTS_MIRROR_TEMPLATE.rstrip("X")
 _ROOT_UID = 0
 _REFUSED_EXIT = 3
 
-SANDBOX_CONVERSATION_PATH = PurePosixPath(
-    "/tests/sandbox-agent-proxy/conversation.json"
-)
-_CONVERSATION_IN_TESTS = SANDBOX_CONVERSATION_PATH.relative_to("/tests")
-
 MANAGED_PROVIDER_VARIABLES = frozenset(
     {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        "ANTHROPIC_SMALL_FAST_MODEL",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
@@ -318,7 +311,7 @@ class _RelayPhase(Protocol):
     def verifier_conversation(self) -> object | None: ...
 
     @property
-    def sink(self) -> EventSink: ...
+    def caller_keys(self) -> frozenset[str]: ...
 
     def phase_env(self) -> dict[str, str]: ...
 
@@ -331,12 +324,21 @@ class _RemoteExecutable(Protocol):
 
 
 class RelayEnvironment(BaseEnvironment):
-    """Delegate lifecycle operations, confine secrets, and lock verifier tests."""
+    """Wrap one Harbor environment with the relay's host extension seam.
+
+    Hosts may subclass this environment to decide model routing, which values remain
+    outside the sandbox and records, where trial events are recorded, and which task
+    MCP servers the relay bridges. The defaults use public provider credentials from
+    the process running Harbor and task metadata from ``task.toml``.
+    """
 
     _inner: BaseEnvironment
-    _secrets: SecretSource
     _configured_environments: tuple[tuple[str, Mapping[str, str]], ...]
     _tests_mirror: _TestsMirror | None
+    _sink: EventSink | None
+    relay: _RelayPhase | None
+    outcome: RelayOutcome | None
+    caller_keys: frozenset[str]
 
     def __init__(
         self,
@@ -348,23 +350,14 @@ class RelayEnvironment(BaseEnvironment):
         *,
         environment: dict[str, object],
         relay: object,
-        secrets: object | None = None,
         **kwargs: Any,
     ) -> None:
         if "mounts" in kwargs and not binds_trial_agent_dir(
             trial_paths, kwargs["mounts"]
         ):
             raise SeparateVerifierEnvironmentError(SEPARATE_VERIFIER_UNSUPPORTED)
-        del relay
-        source = (
-            DefaultSecretSource(os.environ)
-            if secrets is None
-            else resolve_collaborator(secrets, label="secrets")
-        )
-        if not isinstance(source, SecretSource):
-            raise TypeError("secrets must implement protected_values")
-        self._secrets = source
-        protected = source.protected_values()
+        self.config = RelayConfig.model_validate(relay)
+        protected = self.protected_values()
         resolved_task_env = (
             resolve_env_vars(task_env_config.env) if task_env_config.env else {}
         )
@@ -403,7 +396,10 @@ class RelayEnvironment(BaseEnvironment):
         )
 
         self._tests_mirror = None
+        self._sink = None
         self.relay = None
+        self.outcome = None
+        self.caller_keys = frozenset()
         super().__init__(
             environment_dir,
             environment_name,
@@ -438,9 +434,45 @@ class RelayEnvironment(BaseEnvironment):
     def default_user(self, value: str | int | None) -> None:
         self._inner.default_user = value
 
+    @property
+    def trial(self) -> TrialIdentity:
+        """Return this Harbor trial's stable record identity."""
+        return TrialIdentity(
+            self.trial_paths.trial_dir.name, self.trial_paths.trial_dir
+        )
+
+    async def route(self, call: ModelCall) -> Route:
+        """Select the default public-provider destination for one model call."""
+        return await default_route(call)
+
+    def protected_values(self) -> Collection[str]:
+        """Return host values that must never enter this sandbox or its records."""
+        return default_protected_values()
+
+    async def open_event_sink(self, trial: TrialIdentity) -> EventSink:
+        """Open the default redacted outcome file for ``trial``."""
+        return JsonOutcomeSink(
+            trial,
+            protected=lambda: {*self.protected_values(), *self.caller_keys},
+        )
+
+    async def bridged_tool_servers(self) -> Sequence[BridgedMcpServer]:
+        """Read this task's bridged MCP server definitions."""
+        return read_bridged_servers(self.environment_dir.parent)
+
+    async def open_sink(self) -> EventSink:
+        """Open the host sink once and retain it for this trial's lifecycle."""
+        if self._sink is None:
+            self._sink = await self.open_event_sink(self.trial)
+        return self._sink
+
     def attach_relay(self, relay: _RelayPhase) -> None:
+        """Associate this trial's installed-agent relay with its environment."""
         self.relay = relay
-        ENVIRONMENTS[self.trial_paths.trial_dir.name] = self
+
+    def record_runner_loop_outcome(self, outcome: RelayOutcome) -> None:
+        """Retain a runner-loop outcome until ``stop`` delivers it to the host sink."""
+        self.outcome = outcome
 
     def _validate_definition(self) -> None:
         self._inner._validate_definition()
@@ -459,50 +491,21 @@ class RelayEnvironment(BaseEnvironment):
         _ = self._startup_env()
         self._tests_mirror = None
         await self._inner.start(force_build)
-        try:
-            await self._assert_started_sandbox_is_confined()
-        except BaseException as error:
-            await self._stop_after_failed_start(error)
-            raise
-
-    async def _assert_started_sandbox_is_confined(self) -> None:
-        result = await self._inner.exec(
-            "tr '\\000' '\\n' </proc/1/environ; env",
-            user="root",
-        )
-        if result.return_code != 0:
-            raise RuntimeError(
-                "Could not inspect the started sandbox environment for protected values"
-            )
-        for assignment in (result.stdout or "").splitlines():
-            name, separator, value = assignment.partition("=")
-            if separator:
-                self._refuse_protected(
-                    {name: value}, where="the started sandbox environment"
-                )
-
-    async def _stop_after_failed_start(self, error: BaseException) -> None:
-        try:
-            await self._inner.stop(delete=True)
-        except Exception as cleanup_error:  # noqa: BLE001
-            error.add_note(
-                "Stopping the environment after its confinement check failed also failed: "
-                + repr(cleanup_error)
-            )
 
     @override
     async def stop(self, delete: bool) -> None:
-        ENVIRONMENTS.pop(self.trial_paths.trial_dir.name, None)
         relay, self.relay = self.relay, None
         self._tests_mirror = None
-        if relay is not None:
-            outcome: RelayOutcome | None = None
+        try:
+            await self._inner.stop(delete)
+        finally:
             try:
-                outcome = await relay.close()
+                if relay is not None:
+                    self.caller_keys = relay.caller_keys
+                    self.outcome = await relay.close()
             finally:
-                if outcome is not None:
-                    await relay.sink.close(outcome)
-        await self._inner.stop(delete)
+                if self.outcome is not None:
+                    await (await self.open_sink()).close(self.outcome)
 
     @override
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
@@ -563,12 +566,10 @@ class RelayEnvironment(BaseEnvironment):
 
     async def _write_conversation(self, staged: PurePosixPath) -> None:
         relay = self.relay
-        conversation = (
-            None if relay is None else getattr(relay, "verifier_conversation", None)
-        )
+        conversation = None if relay is None else relay.verifier_conversation
         if conversation is None:
             return
-        target = staged / _CONVERSATION_IN_TESTS
+        target = staged / self.config.conversation_path.relative_to("/tests")
         _ = await self._exec_as_root(
             f"umask 077 && mkdir -p {shlex.quote(str(target.parent))}",
             what=f"make {target.parent}",
@@ -805,7 +806,7 @@ class RelayEnvironment(BaseEnvironment):
     ) -> None:
         if not environment:
             return
-        protected = self._secrets.protected_values()
+        protected = self.protected_values()
         exposed = sorted(
             name
             for name, value in environment.items()
@@ -821,16 +822,9 @@ class RelayEnvironment(BaseEnvironment):
         self, env: dict[str, str] | None, *, where: str
     ) -> dict[str, str] | None:
         merged = self._merge_env(env) or {}
-        if self.relay is not None:
-            merged = {
-                name: value
-                for name, value in merged.items()
-                if name not in MANAGED_PROVIDER_VARIABLES
-            }
+        phase_env = {} if self.relay is None else self.relay.phase_env()
+        managed = MANAGED_PROVIDER_VARIABLES | phase_env.keys()
+        merged = {name: value for name, value in merged.items() if name not in managed}
         self._refuse_protected(merged, where=where)
-        if self.relay is not None:
-            merged.update(self.relay.phase_env())
+        merged.update(phase_env)
         return merged or None
-
-
-ENVIRONMENTS: dict[str, RelayEnvironment] = {}
