@@ -78,10 +78,11 @@ default host, or name a subclass that overrides the host seam:
   `[metadata.sandbox_agent_proxy].bridged_mcp_servers` from the task's `task.toml`;
   malformed TOML or metadata raises `ValueError`.
 
-The environment instance holds all per-trial state. `caller_keys` is the set of minted
-caller keys collected when the relay closes, and `outcome` is its `RelayOutcome`. A
-custom event sink can read both when it closes the outcome. Inspect event metadata is
-stored under the `sandbox_agent_proxy` key.
+The environment instance holds all per-trial state. `caller_keys` receives each
+installed agent's minted caller key before setup and before each run phase, then retains
+every key the relay creates; `outcome` is its `RelayOutcome`. A custom event sink can
+read both when it closes the outcome. Inspect event metadata is stored under the
+`sandbox_agent_proxy` key.
 
 ```toml
 [metadata.sandbox_agent_proxy]

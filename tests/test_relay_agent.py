@@ -26,9 +26,10 @@ import pytest
 from harbor_sandbox_agent_proxy import agent, trial_relay
 from harbor_sandbox_agent_proxy.config import RelayConfig
 from harbor_sandbox_agent_proxy.environment import RelayEnvironment
+from harbor_sandbox_agent_proxy.outcome import RelayOutcome
 from harbor_sandbox_agent_proxy.trial_relay import TrialRelay
+from tests.test_relay_environment import _empty_relay_outcome, _inner
 from tests.test_relay_environment import _environment as _relay_environment
-from tests.test_relay_environment import _inner
 
 RELAY: dict[str, object] = {
     "polling_interval": 0.25,
@@ -264,6 +265,13 @@ class FakeTrialRelay:
         self.phase = "verifier"
         self.ended += 1
 
+    @property
+    def caller_keys(self) -> frozenset[str]:
+        return frozenset({self.agent_key, self.verifier_key})
+
+    async def close(self) -> RelayOutcome:
+        return _empty_relay_outcome()
+
 
 class FakeRelayEnvironment(RelayEnvironment):
     async def bridged_tool_servers(self) -> tuple[()]:
@@ -335,6 +343,39 @@ async def test_installed_agent_setup_receives_declared_proxy_connection(
     }
     assert host_key not in setup_env.values()
     assert environment.relay is None
+
+
+async def test_setup_registers_the_agent_key_before_a_relay_opens(
+    tmp_path: Path,
+) -> None:
+    wrapper = _relay_agent(tmp_path, _installed_agent_config())
+    environment = _environment(tmp_path)
+
+    await wrapper.setup(environment)
+    assert environment.relay is None
+
+    await environment.stop(delete=False)
+
+    assert environment.caller_keys == frozenset({wrapper._agent_key})
+
+
+async def test_stop_keeps_caller_keys_from_before_the_relay_attached(
+    tmp_path: Path,
+) -> None:
+    wrapper = _relay_agent(tmp_path, _installed_agent_config())
+    environment = _environment(tmp_path)
+    environment.caller_keys = frozenset({"key-from-before-the-relay"})
+
+    await wrapper.run("do work", environment, agent_context.AgentContext())
+    assert FakeTrialRelay.latest is not None
+
+    await environment.stop(delete=False)
+
+    assert {
+        "key-from-before-the-relay",
+        wrapper._agent_key,
+        FakeTrialRelay.latest.verifier_key,
+    } <= environment.caller_keys
 
 
 async def test_wrapper_environment_is_required_before_setup_or_runner_loop_work(

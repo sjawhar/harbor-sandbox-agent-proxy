@@ -165,6 +165,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         if self._connection is None:
             await self._inner.setup(environment)
             return
+        environment.caller_keys = environment.caller_keys | {self._agent_key}
         with environment.scoped_agent_setup_env(
             self._connection.proxy_env(key=self._agent_key, port=self._config.port)
         ):
@@ -212,6 +213,7 @@ class RelayAgent(harbor_agent_base.BaseAgent):
     ) -> None:
         environment = _relay_environment(environment)
         if self._installed:
+            environment.caller_keys = environment.caller_keys | {self._agent_key}
             await self._relayed_phase(phase, instruction, environment, context)
             return
         try:

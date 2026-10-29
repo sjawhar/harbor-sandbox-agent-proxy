@@ -515,7 +515,7 @@ class RelayEnvironment(BaseEnvironment):
         finally:
             try:
                 if relay is not None:
-                    self.caller_keys = relay.caller_keys
+                    self.caller_keys = self.caller_keys | relay.caller_keys
                     self.outcome = await relay.close()
             finally:
                 if self.outcome is not None:
