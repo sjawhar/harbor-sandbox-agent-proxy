@@ -57,6 +57,7 @@ import asyncio
 import copy
 import dataclasses
 import json
+import pathlib
 from typing import TYPE_CHECKING, Literal, override
 
 import httpx
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _CALLER_KEY = "test-caller-key"
+_FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 type _Json = dict[str, pydantic.JsonValue]
 
@@ -2263,67 +2265,9 @@ _CODEX_POLICY = relay.RelayPolicy(
 
 
 def _fixture(name: str) -> _Json:
-    """Return the captured declaration shape needed by the confinement tests."""
-    namespace: _Json = {
-        "type": "namespace",
-        "name": "mcp__capture_tools",
-        "tools": [
-            {"type": "function", "name": "ping", "parameters": {"type": "object"}},
-            {
-                "type": "function",
-                "name": "echo",
-                "parameters": {"type": "object"},
-            },
-        ],
-    }
-    if name == "codex_responses_tool_search.json":
-        return {
-            "model": "gpt-5.5",
-            "input": [
-                {
-                    "type": "tool_search_output",
-                    "call_id": "call_capture",
-                    "tools": [namespace],
-                }
-            ],
-            "tools": [
-                {"type": "function", "name": "exec_command"},
-                {"type": "tool_search", "execution": "client"},
-            ],
-        }
-    if name == "codex_responses_code_mode.json":
-        return {
-            "model": "gpt-5.6-sol",
-            "input": [
-                {
-                    "type": "additional_tools",
-                    "tools": [
-                        {
-                            "type": "namespace",
-                            "name": "functions",
-                            "tools": [
-                                {"type": "custom", "name": "exec"},
-                                {"type": "custom", "name": "wait"},
-                                {"type": "custom", "name": "request_user_input"},
-                            ],
-                        },
-                        {
-                            "type": "namespace",
-                            "name": "collaboration",
-                            "tools": [
-                                {"type": "function", "name": "followup_task"},
-                                {"type": "function", "name": "interrupt_agent"},
-                                {"type": "function", "name": "list_agents"},
-                                {"type": "function", "name": "send_message"},
-                                {"type": "function", "name": "spawn_agent"},
-                                {"type": "function", "name": "wait_agent"},
-                            ],
-                        },
-                    ],
-                }
-            ],
-        }
-    raise ValueError(f"unknown capture fixture: {name}")
+    """Return a captured Codex request from ``fixtures/`` (the module docstring says how)."""
+    request: _Json = json.loads((_FIXTURES / name).read_text(encoding="utf-8"))
+    return request
 
 
 def _codex_request() -> _Json:
