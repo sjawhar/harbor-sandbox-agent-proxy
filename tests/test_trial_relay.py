@@ -1263,6 +1263,358 @@ async def test_usage_mode_reads_each_dialects_error_counts(
     assert (line["input_tokens"], line["output_tokens"]) == expected
 
 
+_DIALECT_CALL = {
+    "messages": ("generate_anthropic", "anthropic", RequestDialect.MESSAGES),
+    "chat": ("generate_completions", "openai", RequestDialect.CHAT_COMPLETIONS),
+    "responses": ("generate_responses", "openai", RequestDialect.RESPONSES),
+    "gemini": ("generate_google", "google", RequestDialect.GEMINI),
+}
+_ANSWERS = {
+    "messages": {
+        "id": "m",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+    },
+    "chat": {
+        "id": "c",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "g",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+    },
+    "responses": {
+        "id": "r",
+        "object": "response",
+        "created_at": 0,
+        "model": "g",
+        "output": [],
+        "status": "completed",
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+    },
+    "gemini": {
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": [{"text": "ok"}]},
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+    },
+}
+_USAGE_KEY = {"messages": "usage", "chat": "usage", "responses": "usage"}
+_COUNT_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_write_tokens",
+    "cache_read_tokens",
+)
+
+
+def _dialect_call(dialect: str, usage: object, *, status: int) -> RelayCall:
+    method, provider, request_dialect = _DIALECT_CALL[dialect]
+    key = _USAGE_KEY.get(dialect, "usageMetadata")
+    body: dict[str, object] = (
+        {**_ANSWERS[dialect], key: usage} if status == 200 else {key: usage}
+    )
+    return _call().model_copy(
+        update={
+            "method": method,
+            "provider": provider,
+            "dialect": request_dialect,
+            "status": status,
+            "response": body,
+        }
+    )
+
+
+# MACH's unified writer review (gs://theorem-build-io/in/bet/usage-review/20261104/
+# writer-error/REVIEW.md, W1 and W2): every count source the converter uses, iterations
+# and optional contributors included, is validated before conversion; an invalid one
+# leaves the row's counts unread (all null), on both the answered and the error path.
+_UNREAD = (None, None, None, None)
+_SOURCE_CASES = [
+    # W1: iterations are the effective source when present (Inspect sums them).
+    (
+        "messages",
+        {"input_tokens": 4, "output_tokens": 50, "iterations": [{}]},
+        _UNREAD,
+        "iterations_missing",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "iterations": [{"input_tokens": True, "output_tokens": 2.0}],
+        },
+        _UNREAD,
+        "iterations_bad_types",
+    ),
+    (
+        "messages",
+        {"input_tokens": 4, "output_tokens": 50, "iterations": "x"},
+        _UNREAD,
+        "iterations_not_a_list",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "iterations": [
+                {"type": "compaction", "input_tokens": 10, "output_tokens": 20},
+                {"type": "message", "input_tokens": 5, "output_tokens": 30},
+            ],
+        },
+        (15, 50, None, None),
+        "iterations_compaction_summed",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "iterations": [
+                {"type": "fallback_message", "input_tokens": 9, "output_tokens": 9}
+            ],
+        },
+        (4, 50, None, None),
+        "iterations_fallback_uses_top_level",
+    ),
+    # MACH's checked-writer review C2: fallback provenance is decided first, so a
+    # declined attempt without an output count still yields the top-level pair.
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "iterations": [
+                {"type": "message", "input_tokens": 10},
+                {"type": "fallback_message", "input_tokens": 4, "output_tokens": 50},
+            ],
+        },
+        (4, 50, None, None),
+        "iterations_declined_fallback_no_output",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "iterations": [{"type": "fallback_message"}, "x"],
+        },
+        _UNREAD,
+        "iterations_fallback_with_a_non_object",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": True,
+            "output_tokens": 50,
+            "iterations": [{"type": "fallback_message", "input_tokens": 4}],
+        },
+        (None, 50, None, None),
+        "iterations_fallback_keeps_the_top_level_rule",
+    ),
+    # W2: optional contributors and their consistency.
+    (
+        "gemini",
+        {"promptTokenCount": 41, "candidatesTokenCount": 6, "thoughtsTokenCount": -7},
+        _UNREAD,
+        "gemini_negative_thought",
+    ),
+    (
+        "gemini",
+        {
+            "promptTokenCount": 41,
+            "candidatesTokenCount": 6,
+            "cachedContentTokenCount": 50,
+        },
+        _UNREAD,
+        "gemini_cache_over_prompt",
+    ),
+    (
+        "gemini",
+        {"promptTokenCount": 41, "candidatesTokenCount": 6, "thoughtsTokenCount": 3},
+        (41, 9, None, None),
+        "gemini_thoughts_folded",
+    ),
+    (
+        "messages",
+        {"input_tokens": 4, "output_tokens": 50, "cache_creation_input_tokens": -1},
+        _UNREAD,
+        "messages_negative_write",
+    ),
+    (
+        "messages",
+        {"input_tokens": 4, "output_tokens": 50, "cache_read_input_tokens": True},
+        _UNREAD,
+        "messages_bool_read",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 2,
+            "cache_read_input_tokens": 7,
+        },
+        (4, 50, 2, 7),
+        "messages_valid_cache",
+    ),
+    (
+        "chat",
+        {
+            "prompt_tokens": 4,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 10},
+        },
+        _UNREAD,
+        "chat_inconsistent_cache",
+    ),
+    (
+        "chat",
+        {"prompt_tokens": 4, "completion_tokens": 50, "prompt_tokens_details": "x"},
+        _UNREAD,
+        "chat_details_not_an_object",
+    ),
+    (
+        "chat",
+        {
+            "prompt_tokens": 30,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 7},
+        },
+        (23, 50, None, 7),
+        "chat_valid_cache",
+    ),
+    (
+        "responses",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "input_tokens_details": {"cached_tokens": -1},
+        },
+        _UNREAD,
+        "responses_negative_cache",
+    ),
+    (
+        "responses",
+        {
+            "input_tokens": 30,
+            "output_tokens": 50,
+            "input_tokens_details": {"cached_tokens": 7, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+        (23, 50, None, 7),
+        "responses_valid_cache",
+    ),
+]
+
+
+@pytest.mark.parametrize("status", [200, 529])
+@pytest.mark.parametrize(
+    ("dialect", "usage", "expected"),
+    [pytest.param(d, u, e, id=i) for d, u, e, i in _SOURCE_CASES],
+)
+async def test_usage_mode_validates_every_count_source_before_writing(
+    tmp_path: Path,
+    dialect: str,
+    usage: object,
+    expected: tuple[int | None, ...],
+    status: int,
+) -> None:
+    relay_instance = _usage_relay(
+        tmp_path, declared_models=["anthropic/claude-test", "openai/g", "google/g"]
+    )
+    await relay_instance.record(_dialect_call(dialect, usage, status=status))
+    (line,) = _usage_lines(tmp_path)
+    assert tuple(line[key] for key in _COUNT_KEYS) == expected
+    assert set(line) == _MODEL_ROW_KEYS
+
+
+async def test_an_invalid_iteration_does_not_undercount_a_trial(tmp_path: Path) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    ok = _call()
+    await relay_instance.record(
+        ok.model_copy(
+            update={
+                "response": {
+                    **ok.response,  # pyright: ignore[reportGeneralTypeIssues]
+                    "usage": {"input_tokens": 3, "output_tokens": 5},
+                }
+            }
+        )
+    )
+    await relay_instance.record(
+        _error_call(
+            {"usage": {"input_tokens": 4, "output_tokens": 50, "iterations": [{}]}}
+        )
+    )
+    first, second = _usage_lines(tmp_path)
+    assert first["output_tokens"] == 5
+    assert second["output_tokens"] is None  # unread, never an exact 0
+
+
+async def test_an_error_usage_extra_never_reaches_the_converter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[object] = []
+    convert = model_events._convert_response  # pyright: ignore[reportPrivateUsage]
+
+    async def spy(call: RelayCall, answer: dict[str, object]) -> object:
+        seen.append(answer)
+        return await convert(call, answer)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(model_events, "_convert_response", spy)
+    relay_instance = _usage_relay(tmp_path)
+    await relay_instance.record(
+        _error_call(
+            {
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 50,
+                    "extra": "x" * (8 << 20),
+                }
+            }
+        )
+    )
+    (line,) = _usage_lines(tmp_path)
+    assert (line["input_tokens"], line["output_tokens"]) == (4, 50)
+    assert len(seen) == 1 and len(json.dumps(seen[0])) < 1024
+
+
+async def test_a_converted_split_that_is_not_a_count_is_not_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def negative(call: RelayCall, answer: object) -> inspect_ai.model.ModelOutput:
+        return inspect_ai.model.ModelOutput(
+            model="m",
+            choices=[],
+            usage=inspect_ai.model.ModelUsage(input_tokens=4, output_tokens=-1),
+        )
+
+    monkeypatch.setattr(model_events, "_convert_response", negative)
+    relay_instance = _usage_relay(tmp_path)
+    await relay_instance.record(
+        _error_call({"usage": {"input_tokens": 4, "output_tokens": 50}})
+    )
+    (line,) = _usage_lines(tmp_path)
+    assert tuple(line[key] for key in _COUNT_KEYS) == _UNREAD
+
+
 async def test_usage_mode_counts_answered_agent_calls_as_full_mode_does(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
