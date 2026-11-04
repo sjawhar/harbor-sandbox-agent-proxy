@@ -1103,6 +1103,21 @@ def _gemini_call(usage_metadata: object) -> RelayCall:
         pytest.param({"promptTokenCount": 41}, (41, None), id="missing_output"),
         pytest.param({}, (None, None), id="empty_metadata"),
         pytest.param(None, (None, None), id="absent_metadata"),
+        *(
+            pytest.param(
+                {**{"promptTokenCount": 41, "candidatesTokenCount": 6}, field: bad},
+                (None, 6) if field == "promptTokenCount" else (41, None),
+                id=f"{field}_{name}",
+            )
+            for field in ("promptTokenCount", "candidatesTokenCount")
+            for name, bad in (
+                ("true", True),
+                ("false", False),
+                ("negative", -1),
+                ("float", 1.0),
+                ("string", "41"),
+            )
+        ),
     ],
 )
 async def test_usage_mode_writes_null_for_a_gemini_count_the_provider_did_not_report(

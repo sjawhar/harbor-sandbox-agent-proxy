@@ -586,7 +586,8 @@ def _dialect(call: RelayCall) -> str | None:
 
 
 # Inspect's Google converter turns an absent promptTokenCount or candidatesTokenCount into
-# 0. A count the provider did not report is written as null, never as a measured zero.
+# 0. A count the provider did not report as a non-negative integer (absent, a bool, a
+# negative, a float or a string) is written as null, never as a measured count.
 _GEMINI_REQUIRED_COUNTS = {
     "input_tokens": "promptTokenCount",
     "output_tokens": "candidatesTokenCount",
@@ -607,9 +608,8 @@ def _reported_counts(
             else None
         )
         for key, field in _GEMINI_REQUIRED_COUNTS.items():
-            if not isinstance(metadata, dict) or not isinstance(
-                metadata.get(field), int
-            ):
+            value = metadata.get(field) if isinstance(metadata, dict) else None
+            if type(value) is not int or value < 0:
                 counts[key] = None
     return counts
 
