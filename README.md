@@ -106,10 +106,12 @@ checks the recorded outcome.
 
 ## Per-trial token accounting
 
-Set `relay.token_budget` on **both** wrappers to enable accounting. Omit it to keep
-the existing forwarding and recording surface unchanged. A budget covers every
-agent-phase model, root and worker in the trial, across phase swaps; verifier calls
-are metered but do not spend the agent allocation.
+Set the same `relay.token_budget` on **both** wrappers. With `enforce: true`, one
+budget gates every agent-phase model, root and worker across phase swaps;
+verifier calls are metered without spending the agent allocation. Omit the block
+for no accounting. With `enforce: false`, forwarding and ordinary recording use
+the same path as no budget: existing authentication, model pins, confinement and
+recording caps remain, but budget decisions cannot refuse or modify a call.
 
 ```json
 {
@@ -146,7 +148,26 @@ credit it for an identical root-only reroll and later first-message continuation
 `none` profiles still charge the full prompt. Admission reserves the whole final
 request in either case.
 
-Admission reserves all final forwarded UTF-8 JSON bytes plus the trusted gateway
+Shadow mode evaluates a copy of the proposed request. It does not inject output
+limits, force streaming usage options, wait for reservations, obey a budget latch,
+or cancel handlers. Missing profiles, unsupported inputs, invalid proposed policy
+or request values, closed accounting, and budget journal/snapshot errors become
+`would_refuse` events in `sandbox-agent-proxy/budget-shadow.jsonl`, with a reason
+and stage. The mode must be an explicit Boolean; an invalid proposed policy is
+diagnostic input only when `enforce` is explicitly `false`.
+
+Shadow observations never add budget fields to calls, `usage.jsonl`, events or
+`outcome.json`, and budget-write errors do not set the ordinary `record_error`.
+The separate log includes raw usage and available final-body/bound measurements;
+unavailable measurements remain null. Diagnostic call ids are independent of the
+ordinary recorder's ids. If the shadow log itself cannot be written, forwarding
+still continues: the host logger reports its reason/stage and the observer keeps
+its last refusal in memory. No durable observation is claimed in that case.
+
+Accounting artifacts (`budget.jsonl`, `budget.json` and the shadow log) do not
+consume `max_recorded_bytes`. That cap remains for the ordinary recording.
+
+Enforcing admission reserves all final forwarded UTF-8 JSON bytes plus the trusted gateway
 injection maximum and every branch's output allowance. It never subtracts prompt
 credit. `overshoot: none` stops when the next reservation cannot fit;
 `one_call` permits one crossing request only with no outstanding holds.
@@ -154,9 +175,9 @@ credit. `overshoot: none` stops when the next reservation cannot fit;
 refusal, not an arithmetic defect. `unknown_usage: bound` charges missing
 components at their bounds; `stop` also fences further admission.
 
-Text and client tool protocols are supported, including Responses client
-tool-search and additional-tools items. Images, files, server-held conversation
-continuations and server compaction are refused before confinement. Opaque
+With enforcement enabled, text and client tool protocols are supported, including
+Responses tool-search and additional-tools items. Images, files, server-held
+conversation continuations and server compaction are refused before confinement. Opaque
 Responses reasoning requires `effective_input_tokens_max` in its profile;
 ciphertext bytes are not a token bound. Outside-output thinking requires a
 `thinking_ceiling`, and is multiplied per branch unless the profile explicitly
@@ -172,7 +193,7 @@ token_budget_required = true
 token_budget_limit = 10000000
 ```
 
-The host writes `sandbox-agent-proxy/budget.jsonl` with a durable admission before
+An enforcing trial writes `sandbox-agent-proxy/budget.jsonl` with a durable admission before
 each send, then settlement and admission-ordered commit events. Unsafe observed
 settlements fence admission immediately, even while an earlier call delays their
 commit. Usage records can therefore say `settled_pending_commit`, with null

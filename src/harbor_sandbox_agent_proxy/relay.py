@@ -109,7 +109,8 @@ import httpx
 import pydantic
 from inspect_ai.agent._bridge._errors import PROVIDER_ERROR_KEY
 
-from .budget import BudgetRefused, TrialBudget, UsageMeter, encode_refusal_code, serialize
+from .budget import BudgetRefused, Measurement, TrialBudget, UsageMeter, encode_refusal_code, serialize
+from .budget_shadow import ShadowBudget
 from .routing import ModelCall, RequestDialect, RouteCall, RouteRefused, endpoint_url
 
 if TYPE_CHECKING:
@@ -447,6 +448,7 @@ class _Forwarder:
     client: httpx.AsyncClient
     budget: TrialBudget | None = None
     usage_only: bool = False
+    shadow: ShadowBudget | None = None
     usage: dict[RelayPhase, _PhaseUsage] = dataclasses.field(
         default_factory=lambda: {"agent": _PhaseUsage(), "verifier": _PhaseUsage()}
     )
@@ -477,9 +479,15 @@ def relay_methods(
     client: httpx.AsyncClient,
     budget: TrialBudget | None = None,
     usage_only: bool = False,
+    shadow: ShadowBudget | None = None,
 ) -> dict[str, GenerateMethod]:
     """Build the four ``generate_*`` handlers for a host-provided ``route``."""
-    forwarder = _Forwarder(policy=policy, route=route, record=record, client=client, budget=budget, usage_only=usage_only)
+    if budget is not None and not budget.config.enforce:
+        shadow = shadow or ShadowBudget(budget.config, budget.directory, budget.trial, ledger=budget)
+        budget = None
+    if budget is not None and shadow is not None:
+        raise ValueError("choose one budget mode: enforcing or shadow")
+    forwarder = _Forwarder(policy=policy, route=route, record=record, client=client, budget=budget, usage_only=usage_only, shadow=shadow)
     endpoints = (
         _Endpoint(
             "generate_anthropic",
@@ -552,6 +560,9 @@ class _Call:
         self._model: str | None = None
         self._json_data: dict[str, pydantic.JsonValue] = json_data
         self._budget = forwarder.budget if self._phase == "agent" else None
+        self._shadow = forwarder.shadow if self._phase == "agent" else None
+        self._shadow_surface_ok = True
+        self._shadow_plan = None
         self._compact_record = forwarder.budget is not None and forwarder.usage_only
         self._budget_attempts: list[dict] = []
         self._budget_code: str | None = None
@@ -581,6 +592,8 @@ class _Call:
                 if self._budget.config.enforce and (self._budget.latch_cause or self._budget.admission_fence):
                     self._budget.refuse(self._call_id, self._budget.latch_cause or self._budget.admission_fence, 0)
                 self._budget.validate_surface(self._endpoint.dialect, body)
+            if self._shadow is not None:
+                self._shadow_surface_ok = self._shadow.surface(self._endpoint.dialect, body, self._call_id)
             stripped = self._endpoint.confine(body, self._policy)
             route = await self._forwarder.route(
                 ModelCall(
@@ -595,6 +608,8 @@ class _Call:
             self._endpoint.normalize(body)
             if self._budget is not None:
                 self._plan = self._budget.prepare(self._endpoint.dialect, self._model, body)
+            if self._shadow is not None and self._shadow_surface_ok:
+                self._shadow_plan = self._shadow.prepare(self._endpoint.dialect, self._model, body, self._call_id)
         except BudgetRefused as refusal:
             self._budget_status = refusal.status
             self._budget_code = refusal.code
@@ -663,6 +678,7 @@ class _Call:
                 budget=self._budget, plan=self._plan, call_id=self._call_id,
                 budget_facts=self._budget_attempts,
                 meter_enabled=self._forwarder.budget is not None,
+                shadow=self._shadow, shadow_plan=self._shadow_plan,
             )
             await self._emit(
                 status,
@@ -818,12 +834,18 @@ async def _send_with_retries(
     call_id: str = "",
     budget_facts: list[dict] | None = None,
     meter_enabled: bool = False,
+    shadow: ShadowBudget | None = None,
+    shadow_plan=None,
 ) -> tuple[int | None, pydantic.JsonValue]:
     """Each HTTP attempt owns its own durable admission and raw usage meter."""
     streaming = endpoint.provider is _Provider.GOOGLE or body.get("stream") is True
     last_transport: tuple[int, str] | None = None
     for attempt in range(_MAX_ATTEMPTS):
-        meter = UsageMeter(endpoint.dialect, plan.branches if plan else 1, streaming) if meter_enabled else None
+        if shadow is not None:
+            meter = shadow.meter(endpoint.dialect, shadow_plan.branches if shadow_plan else 1, streaming, call_id, attempt + 1)
+        else:
+            meter = UsageMeter(endpoint.dialect, plan.branches if plan else 1, streaming) if meter_enabled else None
+        shadow_item = await shadow.admit(shadow_plan, call_id, attempt + 1) if shadow is not None else None
         item = await budget.admit(plan, call_id, attempt + 1) if budget is not None else None
         connect_failed, sent, status, retry_after = False, False, None, None
         retry = True
@@ -849,7 +871,15 @@ async def _send_with_retries(
             connect_failed = isinstance(exc, httpx.ConnectError)
             last_transport = (502, f"{method}: gateway transport error: {exc}")
         finally:
-            if meter is not None:
+            if shadow is not None:
+                observed = meter.measurement() if meter is not None else Measurement()
+                shadow.settle(shadow_item, observed, plan=shadow_plan, call_id=call_id, attempt=attempt + 1,
+                              sent=sent, status=getattr(meter, "http_status", status), response_status=status,
+                              connect_failed=connect_failed,
+                              terminal_error=observed.complete and not connect_failed and (
+                                  status is None or (status >= 400 and 200 <= getattr(meter, "http_status", 0) < 300)
+                              ))
+            elif meter is not None:
                 usage = meter.measurement()
                 if item is not None:
                     facts = budget.settle(item, usage, sent=sent,

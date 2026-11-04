@@ -58,6 +58,13 @@ The pinned native-loopback controls are in `tests/test_budget_native.py`.
 `tests/test_budget_delta.py` covers cancellation of the first/all close callers,
 proxy/writer cleanup, shared real close failures, and measured empty-message
 checkpoints with literal charges and independent replay agreement.
+`tests/test_budget_shadow.py` compares actual forwarded bytes/headers, responses
+and both ordinary recording modes against no-budget trials. It covers every
+budget refusal family, policy and measurement errors, journal/snapshot failures,
+phase swaps and recording-cap exclusion. Only clocks and opaque ids are fixed.
+Shadow observations belong in `sandbox-agent-proxy/budget-shadow.jsonl`, not the
+ordinary outcome or usage recording. A shadow log write failure is reported to
+the host logger without failing the request; it cannot establish durable coverage.
 
 ## Artifact contracts
 
@@ -97,11 +104,15 @@ A failure or empty export is not a passed gate.
   `n`, `o`, `terminal`, `successful`, `real_route`, `profile`, `bound_source`,
   `bound_version`, `route_bound_source`, `route_bound_version`,
   `tools_transition`, `thinking_transition`; opaque-reasoning rows additionally
-  name `effective_input_contract`. Count bytes **after** confinement, routed-model
-  normalization, limit injection and Chat usage normalization, from the same
-  representation actually sent. Bounds and injection allowance come from trusted
-  configuration, not sample fitting. Stand-in usage (including the Codex capture
-  server's canned counts of 1) must set `real_route: false` and cannot pass M3.
+  name `effective_input_contract`. In shadow mode, export raw counts, terminal
+  and response-success flags, `forwarded_bytes`, bounds, model and profile from
+  the separate shadow log's `usage` events; map `forwarded_bytes` to
+  `final_body_bytes`. The body measured is the actual baseline body after model
+  normalization/confinement, not the copy with hypothetical limit/usage injection.
+  Join bound-source versions from the frozen launch policy. Missing bounds or
+  profiles and would-refuse/error events are not evidence to discard to make M3
+  pass. Bounds and injection allowance come from trusted configuration, not
+  sample fitting. Stand-in usage must set `real_route: false` and cannot pass M3.
   Successful raw prompt evidence must be nonzero. Transition coverage is required
   for each profile, not borrowed from another profile. Source/provenance review
   remains necessary: a JSON boolean does not authenticate a measurement.
@@ -135,11 +146,14 @@ sample is empirical support for this route/model/mode, not a universal proof.
 ## M3 — per-profile shadow input-bound check (unrun)
 
 First run a lane shadow with both wrappers using `enforce: false` and the actual
-bound/injection source versions. Keep all final-body byte/usage evidence and
-export it under the schema above. Require nonzero successful raw usage, tool and
-thinking transitions, and `n <= r_in` on every call. Ordinary text measurements
-do not enable opaque reasoning without an independent effective-input contract.
-Keep unbounded Gemini modes disabled. A counterexample blocks the canary.
+bound/injection source versions. Shadow mode must preserve baseline traffic and
+recording; it reports budget refusals and budget-write failures only in the
+separate shadow log. Export all final-body/raw-usage evidence under the schema
+above, including unknown/error observations. Require nonzero successful usage,
+representative tool/thinking transitions, and `n <= r_in` on every qualifying
+call. Ordinary text measurements do not enable opaque reasoning without an
+independent effective-input contract. Keep unbounded Gemini modes disabled.
+A counterexample or missing coverage blocks the canary.
 
 ```sh
 : "${SHADOW_JOB:?lane-built Harbor shadow job JSON}"

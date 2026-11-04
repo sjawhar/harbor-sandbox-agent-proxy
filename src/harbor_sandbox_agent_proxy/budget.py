@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Annotated, Callable, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool, StrictInt, model_validator
 
 from .budget_usage import Measurement, UsageMeter
 
@@ -90,6 +90,8 @@ class TokenBudgetConfig(BaseModel):
 
     @model_validator(mode="after")
     def bounds_complete(self):
+        if not self.enforce:
+            return self
         if set(self.output_ceiling) != set(self.profiles):
             raise ValueError("every routed model needs an output ceiling and bound profile")
         if not set(self.thinking_ceiling) <= set(self.profiles) or not set(self.max_branches) <= set(self.profiles):
@@ -97,6 +99,20 @@ class TokenBudgetConfig(BaseModel):
         for model, p in self.profiles.items():
             if p.outside_output_thinking and model not in self.thinking_ceiling:
                 raise ValueError("outside-output thinking requires a ceiling")
+        return self
+
+
+class ShadowBudgetProposal(BaseModel):
+    """An explicitly disabled policy may be invalid; it is diagnostic input only."""
+
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, JsonValue] = Field(init=False)
+    enforce: StrictBool
+
+    @model_validator(mode="after")
+    def disabled_only(self):
+        if self.enforce:
+            raise ValueError("an unvalidated proposal requires enforce:false")
         return self
 
 
@@ -242,8 +258,8 @@ class TrialBudget:
             raise
 
     def recorded_bytes(self) -> int:
-        paths = [self.journal_path, self.snapshot_path, self.directory / "usage.jsonl"]
-        return sum(path.stat().st_size for path in paths if path.exists())
+        path = self.directory / "usage.jsonl"
+        return path.stat().st_size if path.exists() else 0
 
     def prepare(self, dialect: str, model: str, body: dict) -> Plan:
         from .budget_surface import prepare

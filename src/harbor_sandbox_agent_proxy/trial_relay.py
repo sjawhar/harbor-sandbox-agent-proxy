@@ -31,6 +31,7 @@ from inspect_ai.agent import BridgedToolsSpec
 
 from . import model_events
 from .budget import TrialBudget
+from .budget_shadow import ShadowBudget
 from .config import RelayConfig
 from .connection import AgentConnection, served_connection_env
 from .conversation import BridgeConversationSelector
@@ -80,6 +81,7 @@ class TrialRelay:
     refusal_reason: str | None = None
     record_error: Exception | None = None
     budget: TrialBudget | None = dataclasses.field(default=None, init=False)
+    shadow: ShadowBudget | None = dataclasses.field(default=None, init=False)
     _answered_agent_calls: int = 0
     _counts: dict[str, int] = dataclasses.field(
         default_factory=lambda: {
@@ -108,10 +110,14 @@ class TrialRelay:
         if self.port is None:
             self.port = self.config.port
         self._caller_keys.update((self.agent_key, self.verifier_key))
-        if self.config.token_budget is not None:
+        if self.config.token_budget is not None and self.config.token_budget.enforce:
             self.budget = TrialBudget(self.config.token_budget,
                                       self.trial.directory / "sandbox-agent-proxy", self.trial.name,
                                       on_error=self._budget_error)
+        elif self.config.token_budget is not None:
+            self.shadow = ShadowBudget(self.config.token_budget,
+                                       self.trial.directory / "sandbox-agent-proxy", self.trial.name,
+                                       protected=self.protected_values)
 
     def _budget_error(self, error: Exception) -> None:
         if self.record_error is None:
@@ -253,6 +259,8 @@ class TrialRelay:
                     "phase": self.phase,
                     "error": repr(error),
                 }
+        if self.shadow is not None:
+            await self.shadow.close()
         return self._outcome()
 
     def _outcome(self) -> RelayOutcome:
@@ -334,6 +342,7 @@ class TrialRelay:
                                 client=client,
                                 budget=self.budget,
                                 usage_only=self.config.record == "usage",
+                                shadow=self.shadow,
                             ),
                             port=self.port,
                             bridged_tools=self._bridged_tools,
