@@ -25,6 +25,10 @@ class RelayConfig(BaseModel):
     max_request_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     max_calls: int = Field(default=10_000, gt=0)
     max_recorded_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
+    # "full" keeps every call and Inspect event for outcome.json and the verifier's
+    # conversation. "usage" keeps neither: each call appends one line of token usage to
+    # sandbox-agent-proxy/usage.jsonl, and the verifier's conversation is refused.
+    record: Literal["full", "usage"] = "full"
     conversation_path: PurePosixPath = PurePosixPath(
         "/tests/sandbox-agent-proxy/conversation.json"
     )
