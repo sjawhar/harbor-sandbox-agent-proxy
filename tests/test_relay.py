@@ -1750,6 +1750,136 @@ async def test_a_phase_at_its_cap_refuses_further_calls_and_the_next_phase_start
     assert [call.phase for call in calls] == ["agent", "verifier"]
 
 
+async def test_recorded_cap_receipts_are_payload_free_and_once_per_phase() -> None:
+    current: list[tuple[relay.RelayPhase, relay.RelayPolicy]] = [
+        ("agent", _policy(max_recorded_bytes=1024))
+    ]
+    response: _Json = {"content": [{"type": "text", "text": "response-marker" * 2048}]}
+    recorder = _Recorder(_responds(200, response))
+    calls: list[relay.RelayCall] = []
+    receipts: list[relay.RecordedByteCapReceipt] = []
+
+    async def record(call: relay.RelayCall) -> None:
+        calls.append(call)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
+        methods = relay.relay_methods(
+            lambda: current[0],
+            _route(_Token()),
+            record=record,
+            client=client,
+            record_terminal_receipt=receipts.append,
+        )
+        phases: tuple[relay.RelayPhase, ...] = ("agent", "verifier")
+        for phase in phases:
+            current[0] = (phase, _policy(max_recorded_bytes=1024))
+            first = await methods["generate_anthropic"](
+                {"model": "m"}, {"x-api-key": _CALLER_KEY}
+            )
+            assert first == response
+            before = len(receipts)
+            forged = await methods["generate_anthropic"](
+                {"model": "m"}, {"x-api-key": "forged-key"}
+            )
+            assert "not authenticated" in str(forged[relay.PROVIDER_ERROR_KEY])
+            assert len(receipts) == before
+            for _ in range(3):
+                for generate in methods.values():
+                    refused = await generate(
+                        {"model": "m", "metadata": "request-marker"},
+                        {"x-api-key": _CALLER_KEY},
+                    )
+                    assert "recorded-byte cap" in str(refused[relay.PROVIDER_ERROR_KEY])
+            assert len(receipts) == before + 1
+
+    assert len(recorder.requests) == 2
+    assert [call.phase for call in calls] == ["agent", "verifier"]
+    assert [receipt.phase for receipt in receipts] == ["agent", "verifier"]
+    for receipt, call in zip(receipts, calls, strict=True):
+        assert dataclasses.asdict(receipt) == {
+            "kind": "relay_recorded_cap",
+            "phase": call.phase,
+            "time": receipt.time,
+            "recorded_bytes": len(call.model_dump_json().encode("utf-8")),
+            "cap": 1024,
+        }
+        assert isinstance(receipt.time, float)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(receipt, "cap", 0)
+
+
+async def test_request_exceeding_remaining_recording_allowance_keeps_a_receipt() -> (
+    None
+):
+    recorder = _Recorder(_responds(200, {"content": []}))
+    calls: list[relay.RelayCall] = []
+    receipts: list[relay.RecordedByteCapReceipt] = []
+
+    async def record(call: relay.RelayCall) -> None:
+        calls.append(call)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
+        generate = relay.relay_methods(
+            lambda: ("agent", _policy(max_recorded_bytes=4096)),
+            _route(_Token()),
+            record=record,
+            client=client,
+            record_terminal_receipt=receipts.append,
+        )["generate_anthropic"]
+        headers = {"x-api-key": _CALLER_KEY}
+        await generate({"model": "m"}, headers)
+        recorded_bytes = len(calls[0].model_dump_json().encode("utf-8"))
+        assert 0 < recorded_bytes < 4096
+        refused = await generate(
+            {"model": "m", "messages": [{"role": "user", "content": "x" * 4096}]},
+            headers,
+        )
+        assert "recorded-byte cap" in str(refused[relay.PROVIDER_ERROR_KEY])
+        assert len(receipts) == 1
+        assert receipts[0].recorded_bytes == recorded_bytes
+        assert receipts[0].cap == 4096
+        # A receipt observes a refusal; it does not change which later calls fit.
+        smaller = await generate({"model": "m"}, headers)
+
+    assert relay.PROVIDER_ERROR_KEY not in smaller
+    assert len(recorder.requests) == 2
+    assert len(receipts) == 1
+    assert len(calls) == 3
+    assert calls[1].request == {"__refused__": "per-phase cap exceeded"}
+
+
+@pytest.mark.parametrize(
+    ("caps", "message", "forwarded"),
+    [
+        ({"max_calls": 1, "max_recorded_bytes": 1}, "call cap", 1),
+        ({"max_request_bytes": 1}, "request cap", 0),
+    ],
+)
+async def test_other_caps_do_not_emit_recorded_byte_receipts(
+    caps: dict[str, int], message: str, forwarded: int
+) -> None:
+    recorder = _Recorder(_responds(200, {"content": []}))
+    receipts: list[relay.RecordedByteCapReceipt] = []
+
+    async def record(call: relay.RelayCall) -> None:
+        del call
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
+        generate = relay.relay_methods(
+            lambda: ("agent", _policy(**caps)),
+            _route(_Token()),
+            record=record,
+            client=client,
+            record_terminal_receipt=receipts.append,
+        )["generate_anthropic"]
+        await generate({"model": "m"}, {"x-api-key": _CALLER_KEY})
+        refused = await generate({"model": "m"}, {"x-api-key": _CALLER_KEY})
+
+    assert message in str(refused[relay.PROVIDER_ERROR_KEY])
+    assert len(recorder.requests) == forwarded
+    assert receipts == []
+
+
 async def test_concurrent_calls_reserve_the_call_cap_before_the_gateway_await() -> None:
     class BlockingTransport(httpx.AsyncBaseTransport):
         def __init__(self) -> None:

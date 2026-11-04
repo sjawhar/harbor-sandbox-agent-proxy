@@ -84,6 +84,18 @@ every key the relay creates; `outcome` is its `RelayOutcome`. A custom event sin
 read both when it closes the outcome. Inspect event metadata is stored under the
 `sandbox_agent_proxy` key.
 
+`RelayOutcome.terminal_receipts` is an empty-by-default tuple of frozen
+`RecordedByteCapReceipt` records. The relay keeps one receipt per phase on the first
+recorded-byte-cap refusal, even when no more call payloads can be recorded. Each
+receipt contains only `kind` (`relay_recorded_cap`), `phase` (`agent` or `verifier`),
+`time` (UTC Unix seconds as a float), `recorded_bytes`, and `cap`. A request that
+cannot fit the remaining recording allowance also produces a receipt when the
+recorded total is below the cap. The default JSON sink writes these same fields
+under `terminal_receipts`, separately from call payloads. Receipts do not change
+which calls are forwarded, any cap, or payload recording; other refusals do not
+produce recorded-byte-cap receipts. Hosts using `relay_methods` directly can
+receive them through its optional synchronous `record_terminal_receipt` callback.
+
 ```toml
 [metadata.sandbox_agent_proxy]
 bridged_mcp_servers = [

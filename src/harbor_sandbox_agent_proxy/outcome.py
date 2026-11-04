@@ -13,7 +13,7 @@ import inspect_ai.event
 if TYPE_CHECKING:
     from inspect_ai.model import ChatMessage
 
-    from .relay import RelayCall
+    from .relay import RecordedByteCapReceipt, RelayCall
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,6 +45,7 @@ class RelayOutcome:
     runner_atif: Path | None
     runner_atif_sha256: str | None
     record_error: str | None
+    terminal_receipts: tuple[RecordedByteCapReceipt, ...] = ()
 
 
 class EventSink(Protocol):
@@ -73,6 +74,9 @@ class JsonOutcomeSink:
             "trial": self.trial.name,
             "mode": outcome.mode,
             "calls": [call.model_dump(mode="json") for call in outcome.calls],
+            "terminal_receipts": [
+                dataclasses.asdict(receipt) for receipt in outcome.terminal_receipts
+            ],
             "events": [event.model_dump(mode="json") for event in outcome.events],
             "counts": dict(outcome.counts),
             "conversation": (

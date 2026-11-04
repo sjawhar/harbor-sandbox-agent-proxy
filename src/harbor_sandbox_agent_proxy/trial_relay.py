@@ -37,6 +37,7 @@ from .outcome import EventSink, RelayOutcome, TrialIdentity
 from .proxy import sandbox_model_proxy
 from .relay import (
     GATEWAY_TIMEOUT,
+    RecordedByteCapReceipt,
     RelayCall,
     RelayPhase,
     RelayPolicy,
@@ -88,6 +89,9 @@ class TrialRelay:
         }
     )
     _dropped_betas: set[str] = dataclasses.field(default_factory=set)
+    _terminal_receipts: dict[RelayPhase, RecordedByteCapReceipt] = dataclasses.field(
+        default_factory=dict
+    )
     _selector: BridgeConversationSelector = dataclasses.field(
         default_factory=BridgeConversationSelector
     )
@@ -250,6 +254,7 @@ class TrialRelay:
             record_error=repr(self.record_error)
             if self.record_error is not None
             else None,
+            terminal_receipts=tuple(self._terminal_receipts.values()),
         )
 
     def current_policy(self) -> tuple[RelayPhase, RelayPolicy]:
@@ -306,6 +311,7 @@ class TrialRelay:
                                 self.route,
                                 record=self.record,
                                 client=client,
+                                record_terminal_receipt=self.record_terminal_receipt,
                             ),
                             port=self.port,
                             bridged_tools=self._bridged_tools,
@@ -359,6 +365,10 @@ class TrialRelay:
     ) -> None:
         self.events.append(event)
         await self.sink.record(event)
+
+    def record_terminal_receipt(self, receipt: RecordedByteCapReceipt) -> None:
+        """Keep at most the first recorded-byte-cap receipt for each phase."""
+        self._terminal_receipts.setdefault(receipt.phase, receipt)
 
     async def record(self, call: RelayCall) -> None:
         """Append one call and its Inspect events, preserving the first sink failure."""
