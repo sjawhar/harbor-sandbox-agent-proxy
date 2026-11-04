@@ -23,11 +23,18 @@ empirical credit-eligible profile for its frozen model/mode.
 
 Run in this checkout, with its frozen optional dependencies installed. Each Python
 process is memory-capped and niced. `DOCKER_CONFIG` is a fresh empty directory.
+The native renderer controls additionally require the design-captured Inspect
+0.3.285 `proxy.py` as `HSAP_NATIVE_PROXY_SOURCE`. Its SHA256 must be
+`7c1ea740e18e3c3c7e8599afcf2f4a5e8c51e96460f7f3f0c3f06dcdeee3a449`.
+Without that artifact the two native-loopback controls skip; a skipped control
+is not a passed native-encoding check. They exercise actual HTTP/SSE rendering,
+not a deployed CLI or sandbox-service queue.
 
 ```sh
 ( ulimit -v 6291456; nice -n 19 uv sync --all-extras --group dev --frozen )
-( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) nice -n 19 uv run pytest )
-( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) nice -n 19 uv run pytest tests/test_budget*.py )
+: "${HSAP_NATIVE_PROXY_SOURCE:?design-pinned Inspect 0.3.285 proxy.py}"
+( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) HSAP_NATIVE_PROXY_SOURCE="$HSAP_NATIVE_PROXY_SOURCE" nice -n 19 uv run pytest )
+( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) HSAP_NATIVE_PROXY_SOURCE="$HSAP_NATIVE_PROXY_SOURCE" nice -n 19 uv run pytest tests/test_budget*.py )
 ( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) BUDGET_RULES=v2 nice -n 19 uv run pytest tests/test_budget.py -k '71 or 72 or 74 or 79' )
 ```
 
@@ -42,6 +49,12 @@ require the actual lane CLI, builder, native queue, result reader, Job or comple
 real trajectory; their lane-facing acceptance remains unexecuted here. Test 88's
 synthetic bound detector does not execute real M3. Deleted/superseded tests (15,
 26, 39–40, 44, 65) follow the v3 replacements, not the v2 oracle.
+Test coverage is established by the behavior each test executes, not by a repeated
+design-number parameter. Concrete retry/fresh-meter, backoff cancellation,
+cancellation-boundary and recorder-failure controls are in
+`tests/test_budget_failures.py`; partial-settlement fsync/phase-end failure,
+ordered record joins and concurrent close are in `tests/test_budget_review.py`.
+The pinned native-loopback controls are in `tests/test_budget_native.py`.
 
 ## Artifact contracts
 
@@ -51,13 +64,16 @@ The commands below read JSONL artifacts; no command makes a model call itself.
 A failure or empty export is not a passed gate.
 
 - `REPLAY_JSONL`: one row per admitted attempt, with `admit_seq`, `root` (the full
-  semantic root, routed model and dialect included), complete request `messages`,
-  raw `n`, `o`, optional iteration `w`, `committed_charge` joined from the journal,
-  and `old_charge` where the lane has an old relay. Every old-ledger difference
-  must have a nonempty `difference_cause`. Do not derive the oracle's expected
-  charge using production identity/credit helpers. The replay tool normalizes
-  Anthropic/Chat message cache-control envelopes; other dialect exports must
-  preserve their own supported message representation.
+  semantic root), complete request `messages`, frozen `model`, `dialect`, `profile`
+  (profile id) and `credit` (`eligible` or `none`), raw `n`, `o`, optional iteration
+  `w`, and integer `committed_charge` joined from the journal. Every row needs its
+  own frozen profile: one trial may use several models with different credit
+  policies. Missing identity, policy or joined charge fails G1; arithmetic-only
+  exploration cannot certify it. Include `old_charge` where a lane has an old
+  relay, and a nonempty `difference_cause` for every old-ledger difference. Do not
+  derive expected charges using production identity/credit helpers. The oracle
+  drops cache-control only at Anthropic envelope paths; Chat/Responses payloads
+  retain it. Message string/text-block equivalence applies to Anthropic and Chat.
 - `M1_JSONL`: per aligned turn: `attempt`, `platform_charge`, `candidate_charge`,
   `selection_frozen`, `versions_frozen`, `worker_attribution: matched`, `reset`,
   `workers`, `non_anthropic`, `held_out`. Derive platform deltas from consecutive
@@ -70,6 +86,10 @@ A failure or empty export is not a passed gate.
 - `M2_JSONL`: at least 30 real-route calls of one frozen model/mode, with `n`,
   `extends_previous`, provider-counted `tail_tokens`, `thinking_present` and
   `thinking_dropped`. Include retained and omitted earlier reasoning/thinking.
+  Every row's counts must be measured plain integers (`n > 0`, `tail_tokens >= 0`).
+  At least one real extension must compare a positive measured tail; retained and
+  dropped thinking must both occur among comparable extensions, not only on rows
+  that skip the comparison. A nonempty but incomparable trajectory fails M2.
 - `M3_JSONL`: actual successful shadow calls with `final_body_bytes`, `r_in`, raw
   `n`, `o`, `terminal`, `successful`, `real_route`, `profile`, `bound_source`,
   `bound_version`, `route_bound_source`, `route_bound_version`,
@@ -79,6 +99,9 @@ A failure or empty export is not a passed gate.
   representation actually sent. Bounds and injection allowance come from trusted
   configuration, not sample fitting. Stand-in usage (including the Codex capture
   server's canned counts of 1) must set `real_route: false` and cannot pass M3.
+  Successful raw prompt evidence must be nonzero. Transition coverage is required
+  for each profile, not borrowed from another profile. Source/provenance review
+  remains necessary: a JSON boolean does not authenticate a measurement.
 
 ## M1 — comparative reporting only (unrun)
 
@@ -134,8 +157,7 @@ size a limit by multiplying a diagnostic.
 
 ```sh
 : "${REPLAY_JSONL:?complete frozen lane trial export}"
-: "${REPLAY_CREDIT:?none or eligible as actually launched}"
-( ulimit -v 6291456; nice -n 19 uv run python -m tests.budget_replay replay "$REPLAY_JSONL" --credit "$REPLAY_CREDIT" )
+( ulimit -v 6291456; nice -n 19 uv run python -m tests.budget_replay replay "$REPLAY_JSONL" )
 ```
 
 ## G2 — native refusal and grade preservation per lane (unrun)
@@ -148,6 +170,12 @@ expected outcomes. Keep the actual submission and grade after exhaustion. A
 queue client disconnect must still leave measured accounting. Exercise native
 Google correct/missing/wrong/foreign keys; missing/wrong keys must never reach
 routing before F3 can be called closed. Pin the bridge build in that evidence.
+The native code is encoded in the message suffix
+` [hsap-budget-code:<closed_code>]`, decoded by `budget.native_refusal_code`.
+The pinned Inspect Anthropic renderer does not emit `error.code`; do not assert
+that it does. Both native forms must preserve the exact encoded terminal message
+and bind it to the durable refusal event. Decoding an unrelated message is not
+budget-ending acceptance.
 
 ```sh
 : "${G2_JOB:?lane-built native-CLI control job, verifier enabled}"

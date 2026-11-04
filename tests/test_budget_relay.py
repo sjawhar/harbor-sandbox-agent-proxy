@@ -97,7 +97,7 @@ async def test_50_52_budget_latch_precedes_routing_and_has_fixed_error(tmp_path)
     payload = result[relay.PROVIDER_ERROR_KEY]
     assert payload["status"] == 400
     assert payload["code"] == "token_budget"
-    assert payload["message"] == "generate_anthropic: token budget of 1,000,000 spent (1,000,000 tokens counted, rule harbor-growth/1)"
+    assert payload["message"] == "generate_anthropic: token budget of 1,000,000 spent (1,000,000 tokens counted, rule harbor-growth/1) [hsap-budget-code:token_budget]"
     b.release_writer()
 
 

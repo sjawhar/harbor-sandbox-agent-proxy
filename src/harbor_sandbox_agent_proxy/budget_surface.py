@@ -63,11 +63,16 @@ def _blocks(value: object, dialect: str) -> None:
 
 def _tools(tools: object, dialect: str, max_schema: int) -> None:
     from .budget import serialize
+    from .relay import _ToolKind, _anthropic_tool, _completions_tool, _responses_tool
     if not isinstance(tools, list):
         reject()
     for tool in tools:
         if not isinstance(tool, dict):
             reject()
+        classify = {"anthropic": _anthropic_tool, "openai": _completions_tool,
+                    "openai-responses": _responses_tool}.get(dialect)
+        if classify is not None and classify(tool)[0] is _ToolKind.SERVER:
+            continue
         # Existing confinement removes provider-executed declarations. They are not input references.
         kind = tool.get("type", "function")
         if kind == "namespace":
@@ -83,7 +88,8 @@ def _tools(tools: object, dialect: str, max_schema: int) -> None:
         elif dialect == "openai-responses" and kind in ("function", "custom", "tool_search"):
             envelope(tool, {"type", "name", "description", "parameters", "strict", "defer_loading", "format", "execution"})
         elif dialect == "google":
-            envelope(tool, {"functionDeclarations", "googleSearch", "codeExecution", "googleSearchRetrieval", "urlContext"})
+            # Every other key is a server declaration that confinement discards.
+            # Validate only the client declarations that can reach the provider.
             for declaration in tool.get("functionDeclarations", []):
                 envelope(declaration, {"name", "description", "parameters", "parametersJsonSchema", "response", "responseJsonSchema", "behavior"})
                 for key in ("parameters", "parametersJsonSchema", "response", "responseJsonSchema"):
@@ -136,6 +142,8 @@ def validate_surface(dialect: str, body: dict, max_schema: int = 65536) -> None:
             envelope(item, _ITEMS[kind])
             if kind == "message":
                 _blocks(item.get("content"), dialect)
+            if kind in ("function_call_output", "custom_tool_call_output") and isinstance(item.get("output"), list):
+                _blocks(item["output"], dialect)
             if kind.startswith("tool_search") and item.get("execution") != "client":
                 reject()
             if "tools" in item:

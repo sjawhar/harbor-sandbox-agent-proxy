@@ -178,11 +178,19 @@ only a snapshot cache. Read with `harbor_sandbox_agent_proxy.budget.read_budget`
 missing/torn/nonclosed journals are incomplete regardless of the snapshot.
 An active writer owns an exclusive lock. Reusing a trial directory requires an
 explicit `TrialBudget(..., new_ledger=True)`, which preserves the old generation.
+Concurrent close callers await one shutdown operation and receive its same result.
+The journal reader recovers the crossing allowance from admissions, without using
+the snapshot, and joins per-attempt root changes and iteration work.
 
 `classify_ending` checks trusted launch identity and separates natural completion,
 intentional limit/insufficient-budget endings, accounting-censored results and
 runner failures. All retain any available grade. Budget endings require a durable
 refusal bound to the native terminal error, not an unrelated HTTP 400.
+Budget refusals end with ` [hsap-budget-code:<closed_code>]`. This is hsap's
+message encoding: the pinned Inspect renderer preserves it in both native unary
+and SSE errors, but does not emit an Anthropic `error.code` field. Decode the
+terminal message with `budget.native_refusal_code`; decoding alone is not a
+budget witness and does not replace the durable journal/launch-identity checks.
 
 The cap is conditional on the provider/gateway input and output bounds. A measured
 bound violation is a fail-stop detector, not prevention of an already-incurred

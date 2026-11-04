@@ -10,11 +10,12 @@ from .test_budget import api, budget, measured
 def test_68_oracle_discriminates_completion_order_and_collapsing_prefix():
     from .budget_replay import replay
     rows = [{"root": "r", "messages": ["same"], "n": n, "o": 0, "admit_seq": i + 1} for i, n in enumerate((300, 200, 100))]
-    assert replay(list(reversed(rows)))["charges"] == [300, 200, 100]
+    result = replay(list(reversed(rows)), arithmetic_only=True)
+    assert result["charges"] == [300, 200, 100] and not result["passed"]
     rows = [{"root": "r", "messages": ["a"], "n": 100, "o": 10, "admit_seq": 1},
             {"root": "r", "messages": ["a", "b"], "n": 200, "o": 20, "admit_seq": 2}]
-    assert replay(rows)["charges"] == [110, 120]
-    assert replay(rows, credit="none")["charges"] == [110, 220]
+    assert replay(rows, arithmetic_only=True)["charges"] == [110, 120]
+    assert replay(rows, credit="none", arithmetic_only=True)["charges"] == [110, 220]
 
 
 def test_82_m2_rejects_empty_and_dropped_thinking():
@@ -52,10 +53,13 @@ async def test_1_fixture_replay_matches_independent_oracle(tmp_path):
         usage = meter.measurement()
         a = await b.admit(plan, str(i))
         charges.append(b.settle(a, usage)["charge"])
-        rows.append(dict(root="fixture", messages=payload["messages"], n=usage.n, o=usage.o, admit_seq=i + 1))
+        rows.append(dict(root="fixture", messages=payload["messages"], n=usage.n, o=usage.o, admit_seq=i + 1,
+                         model="m", dialect="anthropic", profile=b.config.profiles["m"].id,
+                         credit=b.config.profiles["m"].credit, committed_charge=charges[-1]))
     expected = [10457, 2265, 695, 590, 680, 683, 680]
     assert charges == expected
-    assert replay(rows)["charges"] == expected
+    result = replay(rows)
+    assert result["passed"] and result["charges"] == expected
     assert b.spent == 16050
     assert b.record()["billed_tokens"] == 89595
     await b.close_out()

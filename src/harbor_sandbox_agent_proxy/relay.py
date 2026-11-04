@@ -109,7 +109,7 @@ import httpx
 import pydantic
 from inspect_ai.agent._bridge._errors import PROVIDER_ERROR_KEY
 
-from .budget import BudgetRefused, TrialBudget, UsageMeter, serialize
+from .budget import BudgetRefused, TrialBudget, UsageMeter, encode_refusal_code, serialize
 from .routing import ModelCall, RequestDialect, RouteCall, RouteRefused, endpoint_url
 
 if TYPE_CHECKING:
@@ -703,6 +703,8 @@ class _Call:
         stripped: list[str] | None = None,
     ) -> dict[str, pydantic.JsonValue]:
         """Answer with a provider error; record the refusal unless the phase is over its caps."""
+        if self._budget_code:
+            message = encode_refusal_code(message, self._budget_code)
         payload = _error_payload(self._budget_status if self._budget_code else None, message, None)
         if self._budget_code:
             payload["code"] = self._budget_code
@@ -852,7 +854,12 @@ async def _send_with_retries(
                 if item is not None:
                     facts = budget.settle(item, usage, sent=sent,
                                           status=getattr(meter, "http_status", status),
-                                          connect_failed=connect_failed)
+                                          connect_failed=connect_failed,
+                                          terminal_error=usage.complete and not connect_failed and (
+                                              status is None or (
+                                                  status >= 400 and 200 <= getattr(meter, "http_status", 0) < 300
+                                              )
+                                          ))
                 else:
                     facts = dict(state="verifier", n=usage.n, o=usage.o, charge=0,
                                  attempt=attempt + 1, rule="harbor-growth/1")

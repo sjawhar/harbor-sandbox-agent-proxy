@@ -4,6 +4,8 @@
 
 - Adds optional per-trial `harbor-growth/1` token accounting, validated whole-request reservations, ordered commits, and durable journal recovery.
 - Adds trusted task budget requirements, result classification that retains grades, and offline replay and measurement-gate tools. No budget is enabled by default.
+- Refuses structured non-text tool outputs before confinement, preserves stripped server declarations, and keeps close/recovery diagnostics consistent.
+- Requires per-profile joined-charge evidence in replay gates and carries closed refusal codes through native errors with a strict message encoding.
 
 ## 0.1.2
 

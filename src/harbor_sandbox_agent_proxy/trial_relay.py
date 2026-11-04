@@ -98,6 +98,7 @@ class TrialRelay:
     )
     _checked_conversation: list[inspect_ai.model.ChatMessage] | None = None
     _proxy_task: asyncio.Task[None] | None = None
+    _close_future: asyncio.Future[RelayOutcome] | None = dataclasses.field(default=None, init=False)
     _proxy_stop: asyncio.Event | None = None
     _proxy_exit: dict[str, object] | None = None
     _bridged_tools: tuple[BridgedToolsSpec, ...] = ()
@@ -221,6 +222,20 @@ class TrialRelay:
 
     async def close(self) -> RelayOutcome:
         """Stop the proxy and return every fact the host-side environment needs."""
+        if self._close_future is not None:
+            return await asyncio.shield(self._close_future)
+        completion = asyncio.get_running_loop().create_future()
+        self._close_future = completion
+        try:
+            outcome = await self._close_once()
+        except BaseException as error:
+            completion.set_exception(error)
+            completion.exception()
+            raise
+        completion.set_result(outcome)
+        return outcome
+
+    async def _close_once(self) -> RelayOutcome:
         if self.budget is not None:
             try:
                 await self.budget.close_out()

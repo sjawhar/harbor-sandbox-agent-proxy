@@ -26,6 +26,11 @@ SCHEMA = 1
 CAUSES = frozenset({"limit", "insufficient", "bound_violated", "usage_unknown", "persistence_failed"})
 STAGES = frozenset({"A", "B", "C", "D", "E", "F", "G", "forced_close"})
 CHARGE_KINDS = frozenset({"zero", "measured", "partial", "bound"})
+REFUSAL_CODES = frozenset({
+    "token_budget", "token_budget_insufficient", "token_budget_wait", "budget_closed",
+    "usage_unknown", "unsupported_input", "unsupported_model_profile", "output_limit_required",
+    "invalid_request_value", "invalid_reservation", "reservation_too_large", "unbounded_thinking", "bound_violated",
+})
 Positive = Annotated[StrictInt, Field(gt=0)]
 Nonnegative = Annotated[StrictInt, Field(ge=0)]
 
@@ -145,12 +150,35 @@ class Attempt:
         return self.r_in + self.r_out
 
 
+def native_refusal_code(message: object) -> str | None:
+    """Decode hsap's closed terminal message suffix, not an authentication witness."""
+    if not isinstance(message, str):
+        return None
+    _, marker, tail = message.rpartition(" [hsap-budget-code:")
+    if marker and tail.endswith("]") and tail[:-1] in REFUSAL_CODES:
+        return tail[:-1]
+    return None
+
+
+def encode_refusal_code(message: str, code: str) -> str:
+    if code not in REFUSAL_CODES:
+        raise ValueError("unknown budget refusal code")
+    if native_refusal_code(message) == code:
+        return message
+    return f"{message} [hsap-budget-code:{code}]"
+
+
 def _refusal_message(limit: int, spent: int, cause: str, reserved: int) -> str:
     if cause == "insufficient":
-        return f"token budget of {limit:,} cannot fit the next request ({limit - spent:,} remaining, {reserved:,} reserved, rule {RULE})"
-    if cause == "limit":
-        return f"token budget of {limit:,} spent ({spent:,} tokens counted, rule {RULE})"
-    return f"token budget admission stopped ({cause}, rule {RULE})"
+        text = f"token budget of {limit:,} cannot fit the next request ({limit - spent:,} remaining, {reserved:,} reserved, rule {RULE})"
+        code = "token_budget_insufficient"
+    elif cause == "limit":
+        text = f"token budget of {limit:,} spent ({spent:,} tokens counted, rule {RULE})"
+        code = "token_budget"
+    else:
+        text = f"token budget admission stopped ({cause}, rule {RULE})"
+        code = "token_budget"
+    return encode_refusal_code(text, code)
 
 
 class TrialBudget:
@@ -188,8 +216,10 @@ class TrialBudget:
         self._admitted = 0
         self._waiters: list[asyncio.Future] = []
         self._changed = asyncio.Event()
+        self._close_future: asyncio.Future[dict] | None = None
         self._checkpoints: dict[tuple[str, str], tuple[int, int]] = {}
         self._roots: dict[str, int] = {}
+        self._last_root_id: str | None = None
         self._contexts: dict[str, dict] = {}
         self._closed_peaks = 0
         self._peaks: dict[str, int] = {}
@@ -325,7 +355,8 @@ class TrialBudget:
         raise BudgetRefused(code, message)
 
     def settle(self, item: Attempt, usage: Measurement, *, sent: bool = True,
-               status: int | None = 200, connect_failed: bool = False, forced: bool = False) -> dict:
+               status: int | None = 200, connect_failed: bool = False, forced: bool = False,
+               terminal_error: bool = False) -> dict:
         if item.settled:
             self._stats["late_completion"] += 1
             return dict(state="after_close" if self.lifecycle == "closed" else "late_completion",
@@ -333,7 +364,18 @@ class TrialBudget:
                         call_id=item.call_id, attempt=item.attempt, ledger_id=self.ledger_id)
         item.settled, item.usage, item.task = True, usage, None
         zero = not sent or connect_failed or (status in self.config.zero_charge_statuses and not usage.seen and usage.n is None and usage.o is None)
-        item.stage = "A" if not sent else "B" if connect_failed else "C" if zero else "D" if usage.complete else "E" if usage.n is not None or usage.o is not None else "F"
+        if not sent:
+            item.stage = "A"
+        elif connect_failed:
+            item.stage = "B"
+        elif zero:
+            item.stage = "C"
+        elif usage.complete:
+            item.stage = "G" if terminal_error else "D"
+        elif usage.n is not None or usage.o is not None:
+            item.stage = "E"
+        else:
+            item.stage = "F"
         if forced:
             item.stage = "forced_close"
             self._forced.append(item.seq)
@@ -351,7 +393,8 @@ class TrialBudget:
                           n=usage.n, o=usage.o, reserved=item.reserved, r_in=item.r_in,
                           r_out=item.r_out, forwarded_bytes=item.forwarded_bytes,
                           charge=None, spent_after=None, prefix_tokens=None, latched_after=None,
-                          stage=item.stage, profile=item.profile, rule=RULE)
+                          stage=item.stage, profile=item.profile, rule=RULE,
+                          root_changed=None, iteration_work=usage.w)
         item._zero = zero
         item._unsafe = unsafe
         while (current := self._attempts.get(self._next)) is not None and current.settled:
@@ -385,6 +428,8 @@ class TrialBudget:
             if kind in ("partial", "bound"):
                 self._stats[kind + "_charged"] += charge
         first = item.root_id not in self._roots
+        root_changed = self._last_root_id is not None and item.root_id != self._last_root_id
+        self._last_root_id = item.root_id
         if first:
             self._stats["root_first_use_charged"] += charge
         self._roots[item.root_id] = self._roots.get(item.root_id, 0) + charge
@@ -400,9 +445,9 @@ class TrialBudget:
                 self._closed_peaks += ctx["peak"]
                 self._stats["repeated_root_contexts"] += 1
                 ctx = None
-            elif ctx and structural and structural[1] != ctx["last"]:
+            elif ctx and matches and matches[-1][0] != ctx["msg_hash"]:
                 self._stats["forks"] += 1
-            self._contexts[item.root_id] = dict(peak=max(peak, ctx["peak"] if ctx else 0), last=item.seq)
+            self._contexts[item.root_id] = dict(peak=max(peak, ctx["peak"] if ctx else 0), msg_hash=item.msg_hash)
         checkpoint = None
         key = (item.root_id, item.msg_hash)
         if kind == "measured" and usage.n is not None:
@@ -419,7 +464,8 @@ class TrialBudget:
         facts = dict(state="committed", charge=charge, charge_kind=kind, prefix_tokens=credit,
                      credited_from=credited_from, credit_invalidated=invalidated,
                      spent_after=self.spent, latched_after=self.latch_cause,
-                     root_id=item.root_id, root_first_use=first, branches=item.branches)
+                     root_id=item.root_id, root_changed=root_changed, root_first_use=first,
+                     branches=item.branches, iteration_work=usage.w)
         event = dict(admit_seq=item.seq, call_id=item.call_id, attempt=item.attempt,
                      K=credit, credited_from=credited_from, checkpoint_added=checkpoint,
                      charge=charge, charge_kind=kind, spent_after=self.spent,
@@ -449,6 +495,20 @@ class TrialBudget:
                     **self._diagnostics())
 
     async def close_out(self) -> dict:
+        if self._close_future is not None:
+            return await asyncio.shield(self._close_future)
+        completion = asyncio.get_running_loop().create_future()
+        self._close_future = completion
+        try:
+            result = await self._close_once()
+        except BaseException as error:
+            completion.set_exception(error)
+            completion.exception()
+            raise
+        completion.set_result(result)
+        return result
+
+    async def _close_once(self) -> dict:
         if self.lifecycle == "closed":
             return self.record()
         self.lifecycle = "closing"
@@ -522,14 +582,15 @@ def read_budget(directory: Path) -> dict:
         return dict(complete=False, incomplete_reason="invalid_generation", lifecycle="open")
     result = dict(complete=False, incomplete_reason="missing_close", lifecycle="open", spent=0,
                   held=0, refusals={}, refusal_witnesses=[], forced_settled=[], latch_cause=None,
-                  admission_fence=None, bound_charged=0, partial_charged=0)
+                  admission_fence=None, bound_charged=0, partial_charged=0, crossing_allowance=0)
     result["attempts"] = {}
-    admits, settled, committed = {}, set(), set()
+    admits, settled, committed = {}, {}, set()
     ledger = None
     closed = False
     reason = None
     last_committed_latch = None
     forced = []
+    previous_root = None
     try:
         for expected_seq, line in enumerate(_journal_lines(path)):
             try:
@@ -570,6 +631,17 @@ def read_budget(directory: Path) -> dict:
                 if any(type(event[k]) is not int or event[k] <= 0 for k in ("r_in", "r_out")) or event["R"] != event["r_in"] + event["r_out"]:
                     reason = "invalid_reservation"
                     break
+                allowance = event["crossing_allowance"]
+                fits = result["spent"] + result["held"] + event["R"] <= cfg.limit
+                crossing = cfg.enforce and not fits
+                if crossing and (cfg.overshoot != "one_call" or result["held"] != 0 or result["spent"] >= cfg.limit):
+                    reason = "invalid_crossing"
+                    break
+                expected_allowance = event["R"] if crossing else result["crossing_allowance"]
+                if type(allowance) is not int or allowance != expected_allowance:
+                    reason = "crossing_allowance"
+                    break
+                result["crossing_allowance"] = allowance
                 admits[seq] = event
                 result["held"] += event["R"]
             elif kind == "settle":
@@ -584,7 +656,7 @@ def read_budget(directory: Path) -> dict:
                     break
                 if event["stage"] == "forced_close":
                     forced.append(seq)
-                settled.add(seq)
+                settled[seq] = event
             elif kind == "commit":
                 if seq not in settled or seq != len(committed) + 1:
                     reason = "commit_order"
@@ -600,7 +672,11 @@ def read_budget(directory: Path) -> dict:
                     "ledger_id": ledger, "admit_seq": seq, "charge": charge,
                     "prefix_tokens": event["K"], "spent_after": event["spent_after"],
                     "charge_kind": event["charge_kind"], "latched_after": event["latch_cause_after"],
+                    "root_id": admits[seq]["root_id"],
+                    "root_changed": previous_root is not None and previous_root != admits[seq]["root_id"],
+                    "iteration_work": settled[seq]["w"], "stage": settled[seq]["stage"],
                 }
+                previous_root = admits[seq]["root_id"]
                 if event["latch_cause_after"] is not None:
                     if result["latch_cause"] not in (None, event["latch_cause_after"]):
                         reason = "latch_changed"
