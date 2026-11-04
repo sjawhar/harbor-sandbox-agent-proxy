@@ -257,9 +257,12 @@ class TrialBudget:
             self.release_writer()
             raise
 
+    def accounting_bytes(self) -> int:
+        return sum(path.stat().st_size for path in (self.journal_path, self.snapshot_path) if path.exists())
+
     def recorded_bytes(self) -> int:
         path = self.directory / "usage.jsonl"
-        return path.stat().st_size if path.exists() else 0
+        return self.accounting_bytes() + (path.stat().st_size if path.exists() else 0)
 
     def prepare(self, dialect: str, model: str, body: dict) -> Plan:
         from .budget_surface import prepare

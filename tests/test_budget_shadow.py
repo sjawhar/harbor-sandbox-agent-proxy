@@ -1,6 +1,7 @@
 """A disabled enforcement policy observes; it must not change baseline traffic or records."""
 from __future__ import annotations
 
+import asyncio
 import copy
 import datetime
 import json
@@ -136,6 +137,8 @@ async def run_trial(root, mode, case, enabled):
         connection=AgentConnection("anthropic", ("ANTHROPIC_API_KEY",), ("ANTHROPIC_BASE_URL",)),
         agent_key="caller", verifier_key="verifier")
     observer = getattr(r, "shadow", None)
+    if observer is not None:
+        await asyncio.wrap_future(observer._ready)
     ledger = observer.ledger if observer is not None else r.budget
     if enabled and ledger is not None:
         if case == "closed":
@@ -225,7 +228,7 @@ async def test_shadow_matches_no_budget_bytes_for_every_refusal_and_write_failur
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["usage", "full"])
 @pytest.mark.parametrize("enforce", [False, True])
-async def test_budget_files_are_not_recording_cap_bytes(tmp_path, mode, enforce):
+async def test_shadow_exempts_accounting_but_enforcing_counts_it(tmp_path, mode, enforce):
     cfg_budget = settings(enforce=enforce)
     cfg_budget.profiles["m"].bound_source = "source" * 10000
     trial = TrialIdentity("recording-cap", tmp_path)
@@ -239,6 +242,8 @@ async def test_budget_files_are_not_recording_cap_bytes(tmp_path, mode, enforce)
     def respond(request):
         sent.append(request)
         return httpx.Response(200, json=MESSAGE)
+    if r.shadow is not None:
+        await asyncio.wrap_future(r.shadow._ready)
     ledger = r.budget if enforce else r.shadow.ledger
     assert ledger.journal_path.stat().st_size + ledger.snapshot_path.stat().st_size > 20000
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -246,8 +251,11 @@ async def test_budget_files_are_not_recording_cap_bytes(tmp_path, mode, enforce)
                                       budget=r.budget, shadow=r.shadow, usage_only=mode == "usage")
         for _ in range(2):
             result = await methods["generate_anthropic"](body(), {"x-api-key": "caller"})
-            assert result == MESSAGE
-    assert len(sent) == 2
+            if enforce:
+                assert "recorded-byte cap" in str(result)
+            else:
+                assert result == MESSAGE
+    assert len(sent) == (0 if enforce else 2)
     await r.close()
 
 

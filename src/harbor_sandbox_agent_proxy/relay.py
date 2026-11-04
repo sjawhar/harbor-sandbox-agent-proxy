@@ -780,22 +780,27 @@ class _Call:
         else:
             self._usage.recorded_bytes += actual_bytes - reservation_bytes
 
+    def _recorded_bytes(self) -> int:
+        if self._compact_record:
+            return self._forwarder.budget.recorded_bytes()
+        accounting = self._forwarder.budget.accounting_bytes() if self._forwarder.budget is not None else 0
+        return self._usage.recorded_bytes + accounting
+
     def _over_caps(self) -> bool:
         """Whether recording even a compact refusal would breach a count/byte cap."""
         return (
             self._usage.calls >= self._policy.max_calls
-            or self._usage.recorded_bytes >= self._policy.max_recorded_bytes
+            or self._recorded_bytes() >= self._policy.max_recorded_bytes
         )
 
     def _caps_refusal(self, request_size: int) -> str | None:
         """The per-phase cap this call breaches, or ``None`` when it is within every cap."""
-        if self._compact_record:
-            self._usage.recorded_bytes = self._forwarder.budget.recorded_bytes()
+        recorded_bytes = self._recorded_bytes()
         if self._usage.calls >= self._policy.max_calls:
             return f"per-phase call cap of {self._policy.max_calls} reached"
         if (
-            self._usage.recorded_bytes > 0
-            and self._usage.recorded_bytes + (0 if self._compact_record else request_size)
+            recorded_bytes > 0
+            and recorded_bytes + (0 if self._compact_record else request_size)
             > self._policy.max_recorded_bytes
         ):
             return f"per-phase recorded-byte cap of {self._policy.max_recorded_bytes} reached"
@@ -845,7 +850,7 @@ async def _send_with_retries(
             meter = shadow.meter(endpoint.dialect, shadow_plan.branches if shadow_plan else 1, streaming, call_id, attempt + 1)
         else:
             meter = UsageMeter(endpoint.dialect, plan.branches if plan else 1, streaming) if meter_enabled else None
-        shadow_item = await shadow.admit(shadow_plan, call_id, attempt + 1) if shadow is not None else None
+        shadow_item = shadow.admit(shadow_plan, call_id, attempt + 1) if shadow is not None else None
         item = await budget.admit(plan, call_id, attempt + 1) if budget is not None else None
         connect_failed, sent, status, retry_after = False, False, None, None
         retry = True

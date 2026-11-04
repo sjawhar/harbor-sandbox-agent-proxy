@@ -58,13 +58,24 @@ The pinned native-loopback controls are in `tests/test_budget_native.py`.
 `tests/test_budget_delta.py` covers cancellation of the first/all close callers,
 proxy/writer cleanup, shared real close failures, and measured empty-message
 checkpoints with literal charges and independent replay agreement.
-`tests/test_budget_shadow.py` compares actual forwarded bytes/headers, responses
-and both ordinary recording modes against no-budget trials. It covers every
-budget refusal family, policy and measurement errors, journal/snapshot failures,
-phase swaps and recording-cap exclusion. Only clocks and opaque ids are fixed.
-Shadow observations belong in `sandbox-agent-proxy/budget-shadow.jsonl`, not the
-ordinary outcome or usage recording. A shadow log write failure is reported to
-the host logger without failing the request; it cannot establish durable coverage.
+`tests/test_budget_shadow.py` compares forwarded bytes/headers, responses and
+both ordinary recording modes against no-budget trials, covering refusals,
+policy/meter/write failures and phase swaps. Only clocks and opaque ids are fixed.
+`tests/test_budget_shadow_io.py` uses unfrozen clocks and blocked storage to
+check delivery, response completion, heartbeat, bounded overflow and shutdown.
+`tests/test_budget_shadow_review.py` retains the 13 reviewer controls, adapted to
+await asynchronous initialization before installing ledger hooks and to require
+the enforcing cap's refusal rather than assert its old exclusion.
+
+Shadow writes use one daemon and a 256-operation FIFO, outside the sender's
+completion dependency. Full queues drop and count observations. Shutdown drains
+for at most one second after the baseline proxy stops. Shadow accounting is
+exempt from the baseline recording cap; enforcing journals/snapshots count
+alongside ordinary recording in both modes. Final `observation_status` events
+report coverage loss/errors/timeouts. Missing or incomplete summaries cannot
+establish coverage; host-side `ShadowBudget.observation_status()` also reports a
+pending writer or unavailable log without reading storage. Diagnostic I/O and
+host-log handlers run on the writer, never on the forwarding event loop.
 
 ## Artifact contracts
 
@@ -146,14 +157,15 @@ sample is empirical support for this route/model/mode, not a universal proof.
 ## M3 — per-profile shadow input-bound check (unrun)
 
 First run a lane shadow with both wrappers using `enforce: false` and the actual
-bound/injection source versions. Shadow mode must preserve baseline traffic and
-recording; it reports budget refusals and budget-write failures only in the
-separate shadow log. Export all final-body/raw-usage evidence under the schema
-above, including unknown/error observations. Require nonzero successful usage,
-representative tool/thinking transitions, and `n <= r_in` on every qualifying
-call. Ordinary text measurements do not enable opaque reasoning without an
-independent effective-input contract. Keep unbounded Gemini modes disabled.
-A counterexample or missing coverage blocks the canary.
+bound/injection source versions. Shadow mode preserves baseline traffic and
+recording. Before exporting evidence, require a final `observation_status` event
+with `complete: true` and zero dropped observations: a stalled/lost/erroring
+writer cannot establish coverage. Export all final-body/raw-usage evidence under
+the schema above, including unknown/error observations. Require nonzero
+successful usage, representative tool/thinking transitions, and `n <= r_in` on
+every qualifying call. Ordinary text measurements do not enable opaque reasoning
+without an independent effective-input contract. Keep unbounded Gemini modes
+disabled. A counterexample or missing coverage blocks the canary.
 
 ```sh
 : "${SHADOW_JOB:?lane-built Harbor shadow job JSON}"

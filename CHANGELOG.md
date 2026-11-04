@@ -7,8 +7,8 @@
 - Refuses structured non-text tool outputs before confinement, preserves stripped server declarations, and keeps close/recovery diagnostics consistent.
 - Requires per-profile joined-charge evidence in replay gates and carries closed refusal codes through native errors with a strict message encoding.
 - Keeps shutdown independent of close-caller cancellation and credits measured empty-message prefixes consistently with replay.
-- Makes `enforce: false` observational: proposed refusals and accounting I/O errors go to a separate shadow log without changing requests, responses or ordinary recordings.
-- Excludes budget journals and snapshots from the recording-byte quota in both modes.
+- Makes `enforce: false` observational: one bounded background writer handles accounting and diagnostics without delaying forwarding; overflow drops and counts observations, not model calls.
+- Exempts only shadow accounting from the recording-byte cap; enforcing journals and snapshots count alongside ordinary recording.
 
 ## 0.1.2
 

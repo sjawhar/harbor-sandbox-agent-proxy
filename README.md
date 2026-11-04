@@ -151,21 +151,32 @@ request in either case.
 Shadow mode evaluates a copy of the proposed request. It does not inject output
 limits, force streaming usage options, wait for reservations, obey a budget latch,
 or cancel handlers. Missing profiles, unsupported inputs, invalid proposed policy
-or request values, closed accounting, and budget journal/snapshot errors become
-`would_refuse` events in `sandbox-agent-proxy/budget-shadow.jsonl`, with a reason
-and stage. The mode must be an explicit Boolean; an invalid proposed policy is
-diagnostic input only when `enforce` is explicitly `false`.
+or request values, closed accounting, and journal/snapshot errors produce queued
+`would_refuse` events with a reason and stage. The mode must be an explicit
+Boolean; invalid policy is diagnostic input only with explicit `enforce: false`.
 
-Shadow observations never add budget fields to calls, `usage.jsonl`, events or
-`outcome.json`, and budget-write errors do not set the ordinary `record_error`.
-The separate log includes raw usage and available final-body/bound measurements;
-unavailable measurements remain null. Diagnostic call ids are independent of the
-ordinary recorder's ids. If the shadow log itself cannot be written, forwarding
-still continues: the host logger reports its reason/stage and the observer keeps
-its last refusal in memory. No durable observation is claimed in that case.
+One host-owned daemon thread opens and writes all shadow accounting files,
+including `sandbox-agent-proxy/budget-shadow.jsonl`. Senders enqueue observation
+work without awaiting its processing or durability. The FIFO holds at most 256
+operations; when full, observations are dropped and counted, never model calls.
+After baseline proxy shutdown, close allows at most one second for draining;
+a stuck writer may outlive the trial, with coverage marked incomplete. The final
+`observation_status` event reports drops, errors and close timeout. An absent,
+incomplete or lossy summary is not evidence of complete observation. The host can
+also read `ShadowBudget.observation_status()` without filesystem I/O.
 
-Accounting artifacts (`budget.jsonl`, `budget.json` and the shadow log) do not
-consume `max_recorded_bytes`. That cap remains for the ordinary recording.
+Shadow observations add no budget fields to calls, ordinary usage, events or
+outcomes, and do not set ordinary `record_error`. The separate log contains raw
+usage and available final-body/bound measurements; unavailable values remain
+null. Diagnostic call ids are independent of ordinary recording. If that log
+fails, the writer reports to the host logger; its error and last refusal remain
+in memory. Neither destination is guaranteed when storage is unavailable.
+
+Only shadow accounting files are exempt from `max_recorded_bytes`. Enforcement
+counts the journal and snapshot alongside the ordinary recording, and refuses
+subsequent calls once their combined size exceeds the cap. This is an admission
+guard, not a hard disk quota: admitted calls' settlements and shutdown can still
+write beyond it.
 
 Enforcing admission reserves all final forwarded UTF-8 JSON bytes plus the trusted gateway
 injection maximum and every branch's output allowance. It never subtracts prompt
