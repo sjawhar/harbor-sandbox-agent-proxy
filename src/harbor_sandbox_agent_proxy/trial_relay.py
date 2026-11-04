@@ -360,8 +360,60 @@ class TrialRelay:
         self.events.append(event)
         await self.sink.record(event)
 
+    async def _record_usage(self, call: RelayCall) -> None:
+        """Count one call, pass its model event to the sink live, and append its token
+        usage to usage.jsonl; keep no call or event in memory."""
+        self._counts[f"{call.phase}_calls"] += 1
+        self._dropped_betas.update(
+            stripped.removeprefix("anthropic-beta:")
+            for stripped in call.stripped
+            if stripped.startswith("anthropic-beta:")
+        )
+        try:
+            event = await model_events.model_event_from_call(call)
+            usage = None
+            if event is None:
+                self._counts["refused_calls"] += 1
+            else:
+                if event.error is not None:
+                    self._counts["failed_calls"] += 1
+                usage = None if event.output is None else event.output.usage
+                await self.sink.record(event)
+            line = {
+                "call_id": uuid4().hex,
+                "trial": self.trial.name,
+                "phase": call.phase,
+                "ts_request": call.ts_request.isoformat(),
+                "ts_response": call.ts_response.isoformat(),
+                "model": call.model,
+                "status": call.status,
+                "refused": call.refused,
+                "input_tokens": None if usage is None else usage.input_tokens,
+                "output_tokens": None if usage is None else usage.output_tokens,
+                "cache_write_tokens": None
+                if usage is None
+                else usage.input_tokens_cache_write,
+                "cache_read_tokens": None
+                if usage is None
+                else usage.input_tokens_cache_read,
+                "request_bytes": len(json.dumps(call.request).encode("utf-8")),
+                "response_bytes": len(json.dumps(call.response).encode("utf-8")),
+                "recorded_bytes": len(call.model_dump_json().encode("utf-8")),
+            }
+            destination = self.trial.directory / "sandbox-agent-proxy" / "usage.jsonl"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(line, sort_keys=True) + "\n")
+        except Exception as error:
+            if self.record_error is None:
+                self.record_error = error
+            raise
+
     async def record(self, call: RelayCall) -> None:
         """Append one call and its Inspect events, preserving the first sink failure."""
+        if self.config.record == "usage":
+            await self._record_usage(call)
+            return
         self.calls.append(call)
         self._counts[f"{call.phase}_calls"] += 1
         self._dropped_betas.update(

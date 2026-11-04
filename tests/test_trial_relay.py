@@ -915,3 +915,119 @@ async def test_configured_policy_reaches_the_forwarder(tmp_path: Path) -> None:
         )
         == 1
     )
+
+
+async def test_usage_mode_still_passes_every_model_event_to_the_sink_live(
+    tmp_path: Path,
+) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    sink = relay_instance.sink
+    assert isinstance(sink, _Sink)
+    for expected in range(1, 4):
+        await relay_instance.record(_call())
+        assert len(sink.events) == expected
+    assert all(isinstance(e, inspect_ai.event.ModelEvent) for e in sink.events)
+    assert all(line["trial"] == "usage" for line in _usage_lines(tmp_path))
+    assert relay_instance.events == []
+
+
+def _usage_relay(tmp_path: Path, **overrides: object) -> TrialRelay:
+    return TrialRelay(
+        trial=TrialIdentity(name="usage", directory=tmp_path),
+        config=_settings(record="usage", **overrides),
+        route=_route,
+        sink=_Sink(),
+        connection=_CONNECTION,
+    )
+
+
+async def _forward(relay_instance: TrialRelay, times: int) -> int:
+    sent: list[httpx.Request] = []
+
+    def count(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"content": [], "role": "assistant"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(count)) as client:
+        generate = relay_methods(
+            relay_instance.current_policy,
+            relay_instance.route,
+            record=relay_instance.record,
+            client=client,
+        )["generate_anthropic"]
+        for _ in range(times):
+            _ = await generate(
+                {"model": "claude-test", "messages": []},
+                {"x-api-key": relay_instance.agent_key},
+            )
+    return len(sent)
+
+
+def _usage_lines(tmp_path: Path) -> list[dict[str, object]]:
+    path = tmp_path / "sandbox-agent-proxy" / "usage.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+async def test_usage_mode_writes_one_line_per_call_and_holds_nothing(
+    tmp_path: Path,
+) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    for _ in range(3):
+        await relay_instance.record(_call())
+    await relay_instance.record(_call(phase="verifier"))
+
+    lines = _usage_lines(tmp_path)
+    assert [line["phase"] for line in lines] == ["agent"] * 3 + ["verifier"]
+    assert lines[0]["model"] == "claude-test"
+    assert lines[0]["input_tokens"] == 1
+    assert lines[0]["output_tokens"] == 1
+    assert {"cache_write_tokens", "cache_read_tokens", "recorded_bytes"} <= set(
+        lines[0]
+    )
+    assert len({line["call_id"] for line in lines}) == 4
+    assert relay_instance.calls == []
+    assert relay_instance.events == []
+    assert relay_instance._answered_agent_events == []
+    outcome = relay_instance._outcome()
+    assert outcome.calls == [] and outcome.events == []
+    assert outcome.counts["agent_calls"] == 3
+    assert outcome.counts["verifier_calls"] == 1
+
+
+async def test_usage_mode_refuses_the_verifier_conversation(tmp_path: Path) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    await relay_instance.record(_call())
+    await relay_instance.end_agent_phase()
+    assert relay_instance.refusal_reason is not None
+    assert relay_instance.verifier_conversation == {
+        "refused": relay_instance.refusal_reason
+    }
+
+
+async def test_usage_mode_keeps_the_call_cap(tmp_path: Path) -> None:
+    relay_instance = _usage_relay(tmp_path, max_calls=2)
+    assert await _forward(relay_instance, 4) == 2
+    assert relay_instance.calls == []
+    assert len(_usage_lines(tmp_path)) >= 2
+
+
+async def test_usage_mode_keeps_the_recorded_bytes_cap(tmp_path: Path) -> None:
+    relay_instance = _usage_relay(tmp_path, max_recorded_bytes=1)
+    assert await _forward(relay_instance, 2) == 1
+
+
+async def test_full_mode_is_the_default_and_writes_no_usage_file(
+    tmp_path: Path,
+) -> None:
+    assert RelayConfig(declared_models=("anthropic/claude-test",)).record == "full"
+    relay_instance = TrialRelay(
+        trial=TrialIdentity(name="full", directory=tmp_path),
+        config=_settings(),
+        route=_route,
+        sink=_Sink(),
+        connection=_CONNECTION,
+    )
+    await relay_instance.record(_call())
+    assert len(relay_instance.calls) == 1
+    assert len(relay_instance.events) == 1
+    assert not (tmp_path / "sandbox-agent-proxy" / "usage.jsonl").exists()
