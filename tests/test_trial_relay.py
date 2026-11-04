@@ -1057,6 +1057,65 @@ async def test_usage_mode_uses_the_hosts_call_id_and_a_closed_dialect(
     assert first["dialect"] in trial_relay.USAGE_DIALECTS
 
 
+def _gemini_call(usage_metadata: object) -> RelayCall:
+    now = datetime.datetime.now(datetime.UTC)
+    response: dict[str, object] = {
+        "candidates": [
+            {
+                "content": {"role": "model", "parts": [{"text": "ok"}]},
+                "finishReason": "STOP",
+                "index": 0,
+            }
+        ],
+        "modelVersion": "gemini-test",
+    }
+    if usage_metadata is not None:
+        response["usageMetadata"] = usage_metadata
+    return RelayCall(
+        phase="agent",
+        ts_request=now,
+        ts_response=now,
+        method="generate_google",
+        provider="google",
+        dialect=RequestDialect.GEMINI,
+        model="gemini-test",
+        status=200,
+        latency_ms=1.0,
+        request={"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+        response=response,
+        headers={},
+    )
+
+
+# MACH's review cases (gs://theorem-build-io/in/bet/usage-review/20261104/
+# test_gemini_usage_presence.py): Inspect's Google converter turns an absent
+# promptTokenCount or candidatesTokenCount into 0; usage.jsonl must write null instead.
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        pytest.param(
+            {"promptTokenCount": 41, "candidatesTokenCount": 6}, (41, 6), id="complete"
+        ),
+        pytest.param(
+            {"promptTokenCount": 0, "candidatesTokenCount": 0}, (0, 0), id="real_zeroes"
+        ),
+        pytest.param({"candidatesTokenCount": 6}, (None, 6), id="missing_input"),
+        pytest.param({"promptTokenCount": 41}, (41, None), id="missing_output"),
+        pytest.param({}, (None, None), id="empty_metadata"),
+        pytest.param(None, (None, None), id="absent_metadata"),
+    ],
+)
+async def test_usage_mode_writes_null_for_a_gemini_count_the_provider_did_not_report(
+    tmp_path: Path, metadata: object, expected: tuple[int | None, int | None]
+) -> None:
+    relay_instance = _usage_relay(tmp_path, declared_models=["google/gemini-test"])
+    await relay_instance.record(_gemini_call(metadata))
+    (line,) = _usage_lines(tmp_path)
+    assert (line["input_tokens"], line["output_tokens"]) == expected
+    assert line["dialect"] == "gemini"
+    assert set(line) == _MODEL_ROW_KEYS
+
+
 async def test_usage_mode_counts_answered_agent_calls_as_full_mode_does(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

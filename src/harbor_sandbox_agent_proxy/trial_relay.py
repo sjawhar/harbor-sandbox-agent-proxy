@@ -434,8 +434,7 @@ class TrialRelay:
                 else None,
                 "status": call.status,
                 "refused": _refusal_code(call.refused),
-                "input_tokens": None if usage is None else usage.input_tokens,
-                "output_tokens": None if usage is None else usage.output_tokens,
+                **_reported_counts(call, usage),
                 "cache_write_tokens": None
                 if usage is None
                 else usage.input_tokens_cache_write,
@@ -584,6 +583,35 @@ def _call_id(call: RelayCall) -> dict[str, str]:
 def _dialect(call: RelayCall) -> str | None:
     value = str(getattr(call.dialect, "value", call.dialect))
     return value if value in USAGE_DIALECTS else None
+
+
+# Inspect's Google converter turns an absent promptTokenCount or candidatesTokenCount into
+# 0. A count the provider did not report is written as null, never as a measured zero.
+_GEMINI_REQUIRED_COUNTS = {
+    "input_tokens": "promptTokenCount",
+    "output_tokens": "candidatesTokenCount",
+}
+
+
+def _reported_counts(
+    call: RelayCall, usage: inspect_ai.model.ModelUsage | None
+) -> dict[str, int | None]:
+    counts: dict[str, int | None] = {
+        "input_tokens": None if usage is None else usage.input_tokens,
+        "output_tokens": None if usage is None else usage.output_tokens,
+    }
+    if call.dialect == RequestDialect.GEMINI and usage is not None:
+        metadata = (
+            call.response.get("usageMetadata")
+            if isinstance(call.response, dict)
+            else None
+        )
+        for key, field in _GEMINI_REQUIRED_COUNTS.items():
+            if not isinstance(metadata, dict) or not isinstance(
+                metadata.get(field), int
+            ):
+                counts[key] = None
+    return counts
 
 
 def _refusal_code(refused: str | None) -> str | None:
