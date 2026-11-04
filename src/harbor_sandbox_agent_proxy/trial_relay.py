@@ -377,6 +377,12 @@ class TrialRelay:
             else:
                 if event.error is not None:
                     self._counts["failed_calls"] += 1
+                if (
+                    self.phase == "agent"
+                    and call.phase == "agent"
+                    and _answered(call, event)
+                ):
+                    self._answered_agent_calls += 1
                 usage = None if event.output is None else event.output.usage
                 await self.sink.record(event)
             line = {
@@ -385,9 +391,15 @@ class TrialRelay:
                 "phase": call.phase,
                 "ts_request": call.ts_request.isoformat(),
                 "ts_response": call.ts_response.isoformat(),
-                "model": call.model,
+                "model": call.model
+                if call.model is not None
+                and any(
+                    declared in (call.model, f"{call.provider}/{call.model}")
+                    for declared in self.config.declared_models
+                )
+                else None,
                 "status": call.status,
-                "refused": call.refused,
+                "refused": _refusal_code(call.refused),
                 "input_tokens": None if usage is None else usage.input_tokens,
                 "output_tokens": None if usage is None else usage.output_tokens,
                 "cache_write_tokens": None
@@ -505,6 +517,37 @@ def phase_guarded_tool(
 
 def _answered(call: RelayCall, event: inspect_ai.event.ModelEvent) -> bool:
     return call.status is not None and 200 <= call.status < 300 and event.error is None
+
+
+# usage.jsonl carries no free text from a request or a refusal (a refusal message can
+# echo the request's model field, which a caller may set to its key): only these codes.
+USAGE_REFUSAL_CODES = frozenset(
+    {
+        "unauthenticated",
+        "model_not_declared",
+        "call_cap",
+        "recorded_bytes_cap",
+        "request_too_large",
+        "request_rejected",
+        "refused",
+    }
+)
+
+
+def _refusal_code(refused: str | None) -> str | None:
+    if refused is None:
+        return None
+    if "caller is not authenticated" in refused:
+        return "unauthenticated"
+    if "call cap of" in refused:
+        return "call_cap"
+    if "recorded-byte cap of" in refused:
+        return "recorded_bytes_cap"
+    if "per-phase request cap" in refused:
+        return "request_too_large"
+    if "model" in refused and "declared" in refused:
+        return "model_not_declared"
+    return "request_rejected"
 
 
 def _assistant_key(message: inspect_ai.model.ChatMessageAssistant) -> str:
