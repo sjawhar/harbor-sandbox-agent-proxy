@@ -1135,6 +1135,134 @@ async def test_usage_mode_writes_null_for_a_gemini_count_the_provider_did_not_re
     assert set(line) == _MODEL_ROW_KEYS
 
 
+def _error_call(response: object, *, status: int = 529) -> RelayCall:
+    return _call().model_copy(update={"status": status, "response": response})
+
+
+# The Sol review of proof-evals #64 (finding 1): a 529 whose body reports usage must keep
+# its counts in usage mode, as full mode's reader keeps them from outcome.json.
+async def test_usage_mode_keeps_the_counts_an_error_response_reports(
+    tmp_path: Path,
+) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    ok = _call()
+    ok = ok.model_copy(
+        update={
+            "response": {
+                **ok.response,  # pyright: ignore[reportGeneralTypeIssues]
+                "usage": {"input_tokens": 3, "output_tokens": 5},
+            }
+        }
+    )
+    await relay_instance.record(ok)
+    await relay_instance.record(
+        _error_call(
+            {
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"},
+                "usage": {"input_tokens": 4, "output_tokens": 50},
+            }
+        )
+    )
+    lines = _usage_lines(tmp_path)
+    assert [line["status"] for line in lines] == [200, 529]
+    assert sum(line["output_tokens"] for line in lines) == 55
+    assert (lines[1]["input_tokens"], lines[1]["output_tokens"]) == (4, 50)
+    assert all(set(line) == _MODEL_ROW_KEYS for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        pytest.param(
+            {"type": "error", "error": {"type": "overloaded_error"}},
+            (None, None),
+            id="no_usage",
+        ),
+        pytest.param({"usage": {}}, (None, None), id="empty_usage"),
+        pytest.param(
+            {"usage": {"input_tokens": 4, "output_tokens": True}},
+            (4, None),
+            id="bool_output",
+        ),
+        pytest.param(
+            {"usage": {"input_tokens": -1, "output_tokens": 50}},
+            (None, 50),
+            id="negative_input",
+        ),
+        pytest.param(
+            {"usage": {"input_tokens": 0, "output_tokens": 0}},
+            (0, 0),
+            id="real_zeroes",
+        ),
+        pytest.param("upstream timed out", (None, None), id="not_an_object"),
+    ],
+)
+async def test_usage_mode_reads_an_error_responses_counts_by_the_integer_rule(
+    tmp_path: Path, response: object, expected: tuple[int | None, int | None]
+) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    await relay_instance.record(_error_call(response))
+    (line,) = _usage_lines(tmp_path)
+    assert (line["input_tokens"], line["output_tokens"]) == expected
+    assert set(line) == _MODEL_ROW_KEYS
+
+
+@pytest.mark.parametrize(
+    ("method", "provider", "dialect", "response", "expected"),
+    [
+        pytest.param(
+            "generate_completions",
+            "openai",
+            RequestDialect.CHAT_COMPLETIONS,
+            {"usage": {"prompt_tokens": 30, "completion_tokens": 50}},
+            (30, 50),
+            id="chat-completions",
+        ),
+        pytest.param(
+            "generate_google",
+            "google",
+            RequestDialect.GEMINI,
+            {"usageMetadata": {"promptTokenCount": 30, "candidatesTokenCount": 50}},
+            (30, 50),
+            id="gemini",
+        ),
+        pytest.param(
+            "generate_google",
+            "google",
+            RequestDialect.GEMINI,
+            {"usageMetadata": {"promptTokenCount": 30}},
+            (30, None),
+            id="gemini_missing_output",
+        ),
+        pytest.param(
+            "generate_responses",
+            "openai",
+            RequestDialect.RESPONSES,
+            {"usage": {"input_tokens": 30, "output_tokens": 50}},
+            (30, 50),
+            id="responses",
+        ),
+    ],
+)
+async def test_usage_mode_reads_each_dialects_error_counts(
+    tmp_path: Path,
+    method: str,
+    provider: str,
+    dialect: RequestDialect,
+    response: object,
+    expected: tuple[int | None, int | None],
+) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    await relay_instance.record(
+        _error_call(response).model_copy(
+            update={"method": method, "provider": provider, "dialect": dialect}
+        )
+    )
+    (line,) = _usage_lines(tmp_path)
+    assert (line["input_tokens"], line["output_tokens"]) == expected
+
+
 async def test_usage_mode_counts_answered_agent_calls_as_full_mode_does(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
