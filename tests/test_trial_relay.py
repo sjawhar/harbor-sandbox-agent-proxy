@@ -1389,6 +1389,41 @@ _SOURCE_CASES = [
         (4, 50, None, None),
         "iterations_fallback_uses_top_level",
     ),
+    # MACH's checked-writer review C2: fallback provenance is decided first, so a
+    # declined attempt without an output count still yields the top-level pair.
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "iterations": [
+                {"type": "message", "input_tokens": 10},
+                {"type": "fallback_message", "input_tokens": 4, "output_tokens": 50},
+            ],
+        },
+        (4, 50, None, None),
+        "iterations_declined_fallback_no_output",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": 4,
+            "output_tokens": 50,
+            "iterations": [{"type": "fallback_message"}, "x"],
+        },
+        _UNREAD,
+        "iterations_fallback_with_a_non_object",
+    ),
+    (
+        "messages",
+        {
+            "input_tokens": True,
+            "output_tokens": 50,
+            "iterations": [{"type": "fallback_message", "input_tokens": 4}],
+        },
+        (None, 50, None, None),
+        "iterations_fallback_keeps_the_top_level_rule",
+    ),
     # W2: optional contributors and their consistency.
     (
         "gemini",

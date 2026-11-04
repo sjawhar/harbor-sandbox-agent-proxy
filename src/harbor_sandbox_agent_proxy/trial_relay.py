@@ -726,19 +726,32 @@ def _usage_source(
 
 
 def _iterations(raw: dict[str, pydantic.JsonValue]) -> list[pydantic.JsonValue] | None:
-    """Anthropic's iteration list, checked as Inspect reads it; None when invalid."""
+    """Anthropic's iteration list as Inspect reads it, checked; None when invalid.
+
+    Inspect decides provenance first: when any entry is a ``fallback_message``, the
+    written counts come from the top-level pair and the entries feed none of them (a
+    declined attempt may have no output count), so only the list's shape is checked and
+    nothing is kept. Otherwise the entries are compaction iterations, which Inspect sums
+    instead of the top-level pair, so every entry's counts must be valid.
+    """
     iterations = raw.get("iterations")
     if iterations is None:
         return []
     if not isinstance(iterations, list) or len(iterations) > _MAX_ITERATIONS:
         return None
-    kept: list[pydantic.JsonValue] = []
+    kinds: list[str | None] = []
     for item in iterations:
         if not isinstance(item, dict):
             return None
         kind = item.get("type")
         if kind is not None and not (isinstance(kind, str) and len(kind) <= 64):
             return None
+        kinds.append(kind)
+    if "fallback_message" in kinds:
+        return []
+    kept: list[pydantic.JsonValue] = []
+    for item, kind in zip(iterations, kinds, strict=True):
+        assert isinstance(item, dict)
         if not all(_is_count(item.get(f)) for f in _ITERATION_COUNTS):
             return None
         optional = {f: item[f] for f in _ITERATION_OPTIONAL if item.get(f) is not None}
