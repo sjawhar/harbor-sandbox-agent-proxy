@@ -931,6 +931,47 @@ async def test_usage_mode_still_passes_every_model_event_to_the_sink_live(
     assert relay_instance.events == []
 
 
+async def test_usage_mode_never_writes_a_caller_key_sent_as_the_model(
+    tmp_path: Path,
+) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    ) as client:
+        generate = relay_methods(
+            relay_instance.current_policy,
+            relay_instance.route,
+            record=relay_instance.record,
+            client=client,
+        )["generate_anthropic"]
+        _ = await generate(
+            {"model": relay_instance.agent_key, "messages": []},
+            {"x-api-key": relay_instance.agent_key},
+        )
+    text = (tmp_path / "sandbox-agent-proxy" / "usage.jsonl").read_text()
+    assert relay_instance.agent_key not in text
+    (line,) = _usage_lines(tmp_path)
+    assert line["model"] is None
+    assert line["refused"] in trial_relay.USAGE_REFUSAL_CODES
+
+
+async def test_usage_mode_counts_answered_agent_calls_as_full_mode_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts = {}
+    for mode in ("full", "usage"):
+        relay_instance = TrialRelay(
+            trial=TrialIdentity(name=mode, directory=tmp_path / mode),
+            config=_settings(record=mode),
+            route=_route,
+            sink=_Sink(),
+            connection=_CONNECTION,
+        )
+        await relay_instance.record(_call())
+        counts[mode] = relay_instance._outcome().answered_agent_calls
+    assert counts == {"full": 1, "usage": 1}
+
+
 def _usage_relay(tmp_path: Path, **overrides: object) -> TrialRelay:
     return TrialRelay(
         trial=TrialIdentity(name="usage", directory=tmp_path),
