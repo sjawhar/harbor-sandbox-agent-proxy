@@ -141,6 +141,10 @@ not evidence that its model limits or injection bound hold. M3 must pass before
 an enforced canary. `credit: eligible` additionally requires `credit_evidence`
 from the model/mode's M2 exercise. With `credit: none`, every prompt is charged
 again: the resulting allocation is not comparable to a credited growth budget.
+A measured root-only prompt is an empty-message checkpoint. Eligible profiles
+credit it for an identical root-only reroll and later first-message continuation;
+`none` profiles still charge the full prompt. Admission reserves the whole final
+request in either case.
 
 Admission reserves all final forwarded UTF-8 JSON bytes plus the trusted gateway
 injection maximum and every branch's output allowance. It never subtracts prompt
@@ -178,7 +182,9 @@ only a snapshot cache. Read with `harbor_sandbox_agent_proxy.budget.read_budget`
 missing/torn/nonclosed journals are incomplete regardless of the snapshot.
 An active writer owns an exclusive lock. Reusing a trial directory requires an
 explicit `TrialBudget(..., new_ledger=True)`, which preserves the old generation.
-Concurrent close callers await one shutdown operation and receive its same result.
+Concurrent close callers await one independently owned shutdown task and receive
+its same result. Cancelling any caller does not cancel that task; a surviving or
+later caller can still await cleanup and its actual result or failure.
 The journal reader recovers the crossing allowance from admissions, without using
 the snapshot, and joins per-attempt root changes and iteration work.
 

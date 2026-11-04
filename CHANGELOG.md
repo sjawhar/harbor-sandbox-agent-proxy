@@ -6,6 +6,7 @@
 - Adds trusted task budget requirements, result classification that retains grades, and offline replay and measurement-gate tools. No budget is enabled by default.
 - Refuses structured non-text tool outputs before confinement, preserves stripped server declarations, and keeps close/recovery diagnostics consistent.
 - Requires per-profile joined-charge evidence in replay gates and carries closed refusal codes through native errors with a strict message encoding.
+- Keeps shutdown independent of close-caller cancellation and credits measured empty-message prefixes consistently with replay.
 
 ## 0.1.2
 

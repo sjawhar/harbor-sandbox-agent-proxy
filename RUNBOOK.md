@@ -55,6 +55,9 @@ cancellation-boundary and recorder-failure controls are in
 `tests/test_budget_failures.py`; partial-settlement fsync/phase-end failure,
 ordered record joins and concurrent close are in `tests/test_budget_review.py`.
 The pinned native-loopback controls are in `tests/test_budget_native.py`.
+`tests/test_budget_delta.py` covers cancellation of the first/all close callers,
+proxy/writer cleanup, shared real close failures, and measured empty-message
+checkpoints with literal charges and independent replay agreement.
 
 ## Artifact contracts
 

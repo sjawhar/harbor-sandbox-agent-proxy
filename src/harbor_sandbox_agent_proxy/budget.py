@@ -216,7 +216,8 @@ class TrialBudget:
         self._admitted = 0
         self._waiters: list[asyncio.Future] = []
         self._changed = asyncio.Event()
-        self._close_future: asyncio.Future[dict] | None = None
+        self._close_task: asyncio.Task[dict] | None = None
+        self._close_callers: set[asyncio.Task] = set()
         self._checkpoints: dict[tuple[str, str], tuple[int, int]] = {}
         self._roots: dict[str, int] = {}
         self._last_root_id: str | None = None
@@ -495,18 +496,16 @@ class TrialBudget:
                     **self._diagnostics())
 
     async def close_out(self) -> dict:
-        if self._close_future is not None:
-            return await asyncio.shield(self._close_future)
-        completion = asyncio.get_running_loop().create_future()
-        self._close_future = completion
+        caller = asyncio.current_task()
+        if caller is not None:
+            self._close_callers.add(caller)
         try:
-            result = await self._close_once()
-        except BaseException as error:
-            completion.set_exception(error)
-            completion.exception()
-            raise
-        completion.set_result(result)
-        return result
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(self._close_once())
+            return await asyncio.shield(self._close_task)
+        finally:
+            if caller is not None:
+                self._close_callers.discard(caller)
 
     async def _close_once(self) -> dict:
         if self.lifecycle == "closed":
@@ -523,7 +522,8 @@ class TrialBudget:
                 break
         for item in list(self._attempts.values()):
             if not item.settled:
-                if item.task is not None and item.task is not asyncio.current_task():
+                # A task awaiting this shutdown must not cancel its own cleanup wait.
+                if item.task is not None and item.task is not asyncio.current_task() and item.task not in self._close_callers:
                     item.task.cancel()
                 self.settle(item, Measurement(), forced=True)
         self.lifecycle = "closed"

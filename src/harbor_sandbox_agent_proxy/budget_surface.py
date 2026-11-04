@@ -276,9 +276,9 @@ def prepare(config, dialect: str, model: str, body: dict):
         root["generationConfig"] = {k: v for k, v in root["generationConfig"].items() if k not in {"maxOutputTokens", "candidateCount", "temperature", "topP", "topK", "seed", "stopSequences"}}
     root_id = hashlib.sha256(serialize([dialect, model, root])).hexdigest()
     h = hashlib.sha256(root_id.encode()).digest()
-    prefixes = []
+    prefixes = [h.hex()]
     for message in messages:
         h = hashlib.sha256(h + serialize(_normalized_message(message, dialect))).digest()
         prefixes.append(h.hex())
-    msg_hash = prefixes[-1] if prefixes else h.hex()
+    msg_hash = prefixes[-1]
     return Plan(wire, root_id, tuple(prefixes), msg_hash, r_in, r_out, branches, model, p.id, p.credit == "eligible")
