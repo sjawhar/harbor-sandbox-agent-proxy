@@ -437,12 +437,6 @@ class TrialRelay:
                 "status": call.status,
                 "refused": _refusal_code(call.refused),
                 **_reported_counts(call, usage),
-                "cache_write_tokens": None
-                if usage is None
-                else usage.input_tokens_cache_write,
-                "cache_read_tokens": None
-                if usage is None
-                else usage.input_tokens_cache_read,
                 "request_bytes": len(json.dumps(call.request).encode("utf-8")),
                 "response_bytes": len(json.dumps(call.response).encode("utf-8")),
                 "recorded_bytes": len(call.model_dump_json().encode("utf-8")),
@@ -587,30 +581,69 @@ def _dialect(call: RelayCall) -> str | None:
     return value if value in USAGE_DIALECTS else None
 
 
-# Each dialect's raw usage object and the provider fields its input and output counts
-# come from. A count the provider did not report as a non-negative integer (absent, a
-# bool, a negative, a float or a string) is written as null, never as a measured count:
-# Inspect's Google converter, for one, turns an absent count into 0.
-_RAW_USAGE: dict[RequestDialect, tuple[str, dict[str, str]]] = {
-    RequestDialect.MESSAGES: (
+_Path = tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _UsageSource:
+    """Every raw field a dialect's Inspect converter reads into the written counts.
+
+    ``required`` maps each written count to its provider field; ``optional`` are the
+    other count fields that feed the split (cache, thoughts); ``within`` says which of
+    them a total must cover; ``iterations`` is Anthropic's per-iteration usage list,
+    which Inspect sums instead of the top-level pair when it is present.
+    """
+
+    key: str
+    required: dict[str, str]
+    optional: tuple[_Path, ...] = ()
+    within: tuple[tuple[str, tuple[_Path, ...]], ...] = ()
+    iterations: bool = False
+
+
+_CHAT_CACHE: tuple[_Path, ...] = (
+    ("prompt_tokens_details", "cached_tokens"),
+    ("prompt_tokens_details", "cache_write_tokens"),
+)
+_RESPONSES_CACHE: tuple[_Path, ...] = (
+    ("input_tokens_details", "cached_tokens"),
+    ("input_tokens_details", "cache_write_tokens"),
+)
+_ITERATION_COUNTS = ("input_tokens", "output_tokens")
+_ITERATION_OPTIONAL = ("cache_creation_input_tokens", "cache_read_input_tokens")
+_MAX_ITERATIONS = 1024
+
+# A count the provider did not report as a non-negative integer (absent, a bool, a
+# negative, a float or a string) is never written as a measured count: Inspect's
+# converters default an absent count to 0 and do not check types, signs or totals.
+_USAGE_SOURCES: dict[RequestDialect, _UsageSource] = {
+    RequestDialect.MESSAGES: _UsageSource(
         "usage",
         {"input_tokens": "input_tokens", "output_tokens": "output_tokens"},
+        optional=(("cache_creation_input_tokens",), ("cache_read_input_tokens",)),
+        iterations=True,
     ),
-    RequestDialect.CHAT_COMPLETIONS: (
+    RequestDialect.CHAT_COMPLETIONS: _UsageSource(
         "usage",
         {"input_tokens": "prompt_tokens", "output_tokens": "completion_tokens"},
+        optional=_CHAT_CACHE,
+        within=(("prompt_tokens", _CHAT_CACHE),),
     ),
-    RequestDialect.RESPONSES: (
+    RequestDialect.RESPONSES: _UsageSource(
         "usage",
         {"input_tokens": "input_tokens", "output_tokens": "output_tokens"},
+        optional=_RESPONSES_CACHE,
+        within=(("input_tokens", _RESPONSES_CACHE),),
     ),
-    RequestDialect.GEMINI: (
+    RequestDialect.GEMINI: _UsageSource(
         "usageMetadata",
         {"input_tokens": "promptTokenCount", "output_tokens": "candidatesTokenCount"},
+        optional=(("cachedContentTokenCount",), ("thoughtsTokenCount",)),
+        within=(("promptTokenCount", (("cachedContentTokenCount",),)),),
     ),
 }
 
-# The smallest body each converter accepts around a raw usage object, so an error
+# The smallest body each converter accepts around a usage object, so an error
 # response's usage is normalised by the same Inspect converter as an answered call's.
 _USAGE_ONLY_BODIES: dict[str, dict[str, pydantic.JsonValue]] = {
     "generate_anthropic": {
@@ -643,61 +676,145 @@ _USAGE_ONLY_BODIES: dict[str, dict[str, pydantic.JsonValue]] = {
     "generate_google": {"candidates": []},
 }
 
-
-def _raw_usage(
-    call: RelayCall,
-) -> tuple[dict[str, pydantic.JsonValue], dict[str, str]] | None:
-    """The response's raw usage object and its required count fields, if it has one."""
-    try:
-        key, fields = _RAW_USAGE[RequestDialect(call.dialect)]
-    except (KeyError, ValueError):
-        return None
-    raw = call.response.get(key) if isinstance(call.response, dict) else None
-    return (raw, fields) if isinstance(raw, dict) else None
+# Fields the SDK's usage schema requires but no written count is read from.
+_USAGE_SCHEMA_DEFAULTS: dict[str, dict[str, pydantic.JsonValue]] = {
+    "generate_completions": {"total_tokens": 0},
+    "generate_responses": {
+        "total_tokens": 0,
+        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": 0},
+    },
+}
+_COUNT_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_write_tokens",
+    "cache_read_tokens",
+)
+_MISSING = object()
 
 
 def _is_count(value: object) -> bool:
     return type(value) is int and value >= 0
 
 
-_USAGE_SCHEMA_DEFAULTS: dict[str, dict[str, pydantic.JsonValue]] = {
-    "generate_completions": {"total_tokens": None},
-    "generate_responses": {
-        "total_tokens": None,
-        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-        "output_tokens_details": {"reasoning_tokens": 0},
-    },
-}
+def _at(raw: dict[str, pydantic.JsonValue], path: _Path) -> object:
+    """The value at ``path``; ``_MISSING`` when absent, and ``raw`` itself (never a
+    count) when a container on the way is present but not an object."""
+    value: object = raw
+    for part in path:
+        if value is None:
+            return _MISSING
+        if not isinstance(value, dict):
+            return raw
+        value = value.get(part, _MISSING)  # pyright: ignore[reportUnknownMemberType]
+        if value is _MISSING:
+            return _MISSING
+    return value
+
+
+def _usage_source(
+    call: RelayCall,
+) -> tuple[_UsageSource, dict[str, pydantic.JsonValue]] | None:
+    """The dialect's usage source and the response's raw usage object, if it has one."""
+    try:
+        source = _USAGE_SOURCES[RequestDialect(call.dialect)]
+    except (KeyError, ValueError):
+        return None
+    raw = call.response.get(source.key) if isinstance(call.response, dict) else None
+    return (source, raw) if isinstance(raw, dict) else None
+
+
+def _iterations(raw: dict[str, pydantic.JsonValue]) -> list[pydantic.JsonValue] | None:
+    """Anthropic's iteration list, checked as Inspect reads it; None when invalid."""
+    iterations = raw.get("iterations")
+    if iterations is None:
+        return []
+    if not isinstance(iterations, list) or len(iterations) > _MAX_ITERATIONS:
+        return None
+    kept: list[pydantic.JsonValue] = []
+    for item in iterations:
+        if not isinstance(item, dict):
+            return None
+        kind = item.get("type")
+        if kind is not None and not (isinstance(kind, str) and len(kind) <= 64):
+            return None
+        if not all(_is_count(item.get(f)) for f in _ITERATION_COUNTS):
+            return None
+        optional = {f: item[f] for f in _ITERATION_OPTIONAL if item.get(f) is not None}
+        if not all(_is_count(v) for v in optional.values()):
+            return None
+        kept.append(
+            {
+                **({} if kind is None else {"type": kind}),
+                **{f: item[f] for f in _ITERATION_COUNTS},
+                **optional,
+            }
+        )
+    return kept
+
+
+def _checked_usage(
+    source: _UsageSource, raw: dict[str, pydantic.JsonValue]
+) -> tuple[dict[str, pydantic.JsonValue], set[str]] | None:
+    """The raw usage reduced to the fields the converter reads, each checked, and the
+    written counts whose required field is invalid; None when a contributor or a total
+    is invalid, so the row's counts stay unread."""
+    unread = {k for k, f in source.required.items() if not _is_count(raw.get(f))}
+    usage: dict[str, pydantic.JsonValue] = {
+        f: value if isinstance(value := raw.get(f), int) and _is_count(value) else 0
+        for f in source.required.values()
+    }
+    for path in source.optional:
+        value = _at(raw, path)
+        if value is _MISSING or value is None:
+            continue
+        if not _is_count(value):
+            return None
+        node = usage
+        for part in path[:-1]:
+            child = node.setdefault(part, {})
+            assert isinstance(child, dict)
+            node = child
+        node[path[-1]] = value  # pyright: ignore[reportArgumentType]
+    for total, parts in source.within:
+        values = [_at(raw, p) for p in parts]
+        covered = sum(v for v in values if isinstance(v, int))
+        if _is_count(raw.get(total)) and covered > usage[total]:  # pyright: ignore[reportOperatorIssue]
+            return None
+    if source.iterations:
+        iterations = _iterations(raw)
+        if iterations is None:
+            return None
+        if iterations:
+            usage["iterations"] = iterations
+    return usage, unread
 
 
 async def _error_usage(call: RelayCall) -> inspect_ai.model.ModelUsage | None:
     """The usage an unanswered call's response reports, normalised as an answered call's.
 
     Full recording keeps an error response's body, and its reader counts the usage the
-    body reports; usage mode must not drop those tokens. An invalid required count is
-    passed to the converter as 0 and written as null afterwards by ``_reported_counts``.
+    body reports; usage mode must not drop those tokens. Only the checked fields reach
+    the converter: no other provider data, however large, is passed to it.
     """
-    found = _raw_usage(call)
+    found = _usage_source(call)
     body = _USAGE_ONLY_BODIES.get(call.method)
     if found is None or body is None:
         return None
-    raw, fields = found
-    required: dict[str, int] = {
-        f: value if isinstance(value := raw.get(f), int) and _is_count(value) else 0
-        for f in fields.values()
-    }
-    usage: dict[str, pydantic.JsonValue] = {**raw, **required}
-    # Fields the SDK's usage schema requires but no count is read from; a provider's
-    # own value, when it sent one, is kept.
+    source, raw = found
+    checked = _checked_usage(source, raw)
+    if checked is None:
+        return None
+    usage = checked[0]
     for name, default in _USAGE_SCHEMA_DEFAULTS.get(call.method, {}).items():
         given = usage.get(name)
         if isinstance(default, dict):
             usage[name] = {**default, **(given if isinstance(given, dict) else {})}
-        elif name not in usage:
-            usage[name] = sum(required.values())  # a total
-    answer = {**body, _RAW_USAGE[RequestDialect(call.dialect)][0]: usage}
+        else:
+            usage.setdefault(name, default)
     try:
-        output = await model_events._convert_response(call, answer)  # pyright: ignore[reportPrivateUsage]
+        output = await model_events._convert_response(call, {**body, source.key: usage})  # pyright: ignore[reportPrivateUsage]
     except (ValueError, TypeError, KeyError):
         return None
     return output.usage
@@ -706,21 +823,29 @@ async def _error_usage(call: RelayCall) -> inspect_ai.model.ModelUsage | None:
 def _reported_counts(
     call: RelayCall, usage: inspect_ai.model.ModelUsage | None
 ) -> dict[str, int | None]:
-    counts: dict[str, int | None] = {
-        "input_tokens": None if usage is None else usage.input_tokens,
-        "output_tokens": None if usage is None else usage.output_tokens,
-    }
+    """The four written counts: the converted split, with every count the provider did
+    not validly report, and every split built on an invalid source, written as null."""
+    unread: dict[str, int | None] = dict.fromkeys(_COUNT_KEYS)
     if usage is None:
-        return counts
-    found = _raw_usage(call)
+        return unread
+    counts: dict[str, int | None] = {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_write_tokens": usage.input_tokens_cache_write,
+        "cache_read_tokens": usage.input_tokens_cache_read,
+    }
+    found = _usage_source(call)
     if found is None:
         if call.dialect == RequestDialect.GEMINI:
-            return {"input_tokens": None, "output_tokens": None}
-        return counts
-    raw, fields = found
-    for key, field in fields.items():
-        if not _is_count(raw.get(field)):
+            counts["input_tokens"] = counts["output_tokens"] = None
+    else:
+        checked = _checked_usage(*found)
+        if checked is None:
+            return unread
+        for key in checked[1]:
             counts[key] = None
+    if not all(value is None or _is_count(value) for value in counts.values()):
+        return unread
     return counts
 
 
