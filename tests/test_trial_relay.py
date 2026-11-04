@@ -985,9 +985,62 @@ async def test_usage_mode_keeps_no_refused_tool_call_arguments(tmp_path: Path) -
     assert len(sink.events) == 3
     text = (tmp_path / "sandbox-agent-proxy" / "usage.jsonl").read_text()
     assert "private-request-text" not in text
-    assert [line["refused"] for line in _usage_lines(tmp_path)] == [
-        "tool_outside_agent_phase"
-    ] * 3
+    lines = _usage_lines(tmp_path)
+    assert [line["refused"] for line in lines] == ["tool_outside_agent_phase"] * 3
+    assert all(set(line) == _TOOL_ROW_KEYS for line in lines)
+    assert lines[0]["call_id_source"] == "generated"
+    assert lines[0]["refused"] in trial_relay.USAGE_REFUSAL_CODES
+
+
+# The usage.jsonl schema; the task harness's recorder (HSAP_RECORD=usage) pins the same
+# two key sets and refusal codes.
+_MODEL_ROW_KEYS = {
+    "call_id",
+    "call_id_source",
+    "dialect",
+    "trial",
+    "phase",
+    "ts_request",
+    "ts_response",
+    "model",
+    "status",
+    "refused",
+    "input_tokens",
+    "output_tokens",
+    "cache_write_tokens",
+    "cache_read_tokens",
+    "request_bytes",
+    "response_bytes",
+    "recorded_bytes",
+}
+_TOOL_ROW_KEYS = {
+    "call_id",
+    "call_id_source",
+    "trial",
+    "phase",
+    "kind",
+    "tool",
+    "refused",
+}
+
+
+def test_usage_refusal_codes_are_the_shared_set() -> None:
+    assert trial_relay.USAGE_REFUSAL_CODES == {
+        "unauthenticated",
+        "model_not_declared",
+        "call_cap",
+        "recorded_bytes_cap",
+        "request_too_large",
+        "request_rejected",
+        "tool_outside_agent_phase",
+    }
+
+
+async def test_usage_model_rows_have_the_shared_keys(tmp_path: Path) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    await relay_instance.record(_call())
+    assert await _forward(relay_instance, 1) == 1
+    assert all(set(line) == _MODEL_ROW_KEYS for line in _usage_lines(tmp_path))
 
 
 async def test_usage_mode_uses_the_hosts_call_id_and_a_closed_dialect(

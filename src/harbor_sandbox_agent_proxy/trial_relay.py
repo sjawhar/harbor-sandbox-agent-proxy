@@ -371,6 +371,7 @@ class TrialRelay:
             self._append_usage_line(
                 {
                     "call_id": uuid4().hex,
+                    "call_id_source": "generated",
                     "trial": self.trial.name,
                     "phase": self.phase,
                     "kind": "tool_refused",
@@ -559,7 +560,7 @@ USAGE_REFUSAL_CODES = frozenset(
         "recorded_bytes_cap",
         "request_too_large",
         "request_rejected",
-        "refused",
+        "tool_outside_agent_phase",
     }
 )
 
