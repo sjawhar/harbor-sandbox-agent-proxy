@@ -952,7 +952,56 @@ async def test_usage_mode_never_writes_a_caller_key_sent_as_the_model(
     assert relay_instance.agent_key not in text
     (line,) = _usage_lines(tmp_path)
     assert line["model"] is None
-    assert line["refused"] in trial_relay.USAGE_REFUSAL_CODES
+    assert line["refused"] == "model_not_declared"
+
+
+@inspect_ai.tool.tool
+def _echo() -> inspect_ai.tool.Tool:
+    async def execute(text: str) -> str:
+        """Echo the text.
+
+        Args:
+            text: The text.
+        """
+        return text
+
+    return execute
+
+
+async def test_usage_mode_keeps_no_refused_tool_call_arguments(tmp_path: Path) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    guarded = trial_relay.phase_guarded_tool(
+        _echo(),
+        server="task-tools",
+        phase=lambda: "verifier",
+        refused=relay_instance._record_refused_tool_call,
+    )
+    for _ in range(3):
+        with pytest.raises(inspect_ai.tool.ToolError):
+            await guarded(text="private-request-text")
+    assert relay_instance.events == []
+    sink = relay_instance.sink
+    assert isinstance(sink, _Sink)
+    assert len(sink.events) == 3
+    text = (tmp_path / "sandbox-agent-proxy" / "usage.jsonl").read_text()
+    assert "private-request-text" not in text
+    assert [line["refused"] for line in _usage_lines(tmp_path)] == [
+        "tool_outside_agent_phase"
+    ] * 3
+
+
+async def test_usage_mode_uses_the_hosts_call_id_and_a_closed_dialect(
+    tmp_path: Path,
+) -> None:
+    relay_instance = _usage_relay(tmp_path)
+    await relay_instance.record(
+        _call().model_copy(update={"headers": {"x-bet-eval-call-id": "host-42"}})
+    )
+    await relay_instance.record(_call())
+    first, second = _usage_lines(tmp_path)
+    assert (first["call_id"], first["call_id_source"]) == ("host-42", "header")
+    assert second["call_id_source"] == "generated"
+    assert first["dialect"] in trial_relay.USAGE_DIALECTS
 
 
 async def test_usage_mode_counts_answered_agent_calls_as_full_mode_does(

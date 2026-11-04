@@ -43,7 +43,7 @@ from .relay import (
     mint_caller_key,
     relay_methods,
 )
-from .routing import RouteCall
+from .routing import RequestDialect, RouteCall
 from .sandbox_adapter import HarborSandboxEnvironment
 from .sandbox_binding import bind_sandbox_environment
 from .task_metadata import BridgedMcpServer
@@ -168,6 +168,10 @@ class TrialRelay:
         self.verifier_key = mint_caller_key()
         self._caller_keys.add(self.verifier_key)
         selected = self._selector.selected
+        if self.config.record == "usage":
+            self.refusal_reason = "the conversation is not recorded in usage mode"
+            self.verifier_conversation = {"refused": self.refusal_reason}
+            return
         if self._answered_agent_calls == 0 or selected is None:
             self.refusal_reason = (
                 "the agent made no answered model call through the relay"
@@ -357,8 +361,36 @@ class TrialRelay:
     async def _record_refused_tool_call(
         self, event: inspect_ai.event.ToolEvent
     ) -> None:
+        if self.config.record == "usage":
+            await self.sink.record(event)
+            allowed = {
+                inspect_ai.tool.ToolDef(tool).name
+                for spec in self._bridged_tools
+                for tool in spec.tools
+            }
+            self._append_usage_line(
+                {
+                    "call_id": uuid4().hex,
+                    "trial": self.trial.name,
+                    "phase": self.phase,
+                    "kind": "tool_refused",
+                    "tool": event.function if event.function in allowed else None,
+                    "refused": "tool_outside_agent_phase",
+                }
+            )
+            return
         self.events.append(event)
         await self.sink.record(event)
+
+    def _append_usage_line(self, line: dict[str, object]) -> None:
+        redacted = json.dumps(line, sort_keys=True)
+        for secret in self.protected_values():
+            if secret:
+                redacted = redacted.replace(secret, "[REDACTED]")
+        destination = self.trial.directory / "sandbox-agent-proxy" / "usage.jsonl"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("a", encoding="utf-8") as handle:
+            handle.write(redacted + "\n")
 
     async def _record_usage(self, call: RelayCall) -> None:
         """Count one call, pass its model event to the sink live, and append its token
@@ -386,7 +418,8 @@ class TrialRelay:
                 usage = None if event.output is None else event.output.usage
                 await self.sink.record(event)
             line = {
-                "call_id": uuid4().hex,
+                **_call_id(call),
+                "dialect": _dialect(call),
                 "trial": self.trial.name,
                 "phase": call.phase,
                 "ts_request": call.ts_request.isoformat(),
@@ -412,10 +445,7 @@ class TrialRelay:
                 "response_bytes": len(json.dumps(call.response).encode("utf-8")),
                 "recorded_bytes": len(call.model_dump_json().encode("utf-8")),
             }
-            destination = self.trial.directory / "sandbox-agent-proxy" / "usage.jsonl"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(line, sort_keys=True) + "\n")
+            self._append_usage_line(line)
         except Exception as error:
             if self.record_error is None:
                 self.record_error = error
@@ -532,6 +562,27 @@ USAGE_REFUSAL_CODES = frozenset(
         "refused",
     }
 )
+
+
+USAGE_DIALECTS = frozenset(dialect.value for dialect in RequestDialect)
+_CALL_ID_HEADER = "x-bet-eval-call-id"
+
+
+def _call_id(call: RelayCall) -> dict[str, str]:
+    """The host's own call id when the call carried one (a bounded token), else a fresh id."""
+    for key, value in call.headers.items():
+        if (
+            key.lower() == _CALL_ID_HEADER
+            and 0 < len(value) <= 128
+            and all(c.isalnum() or c in "-_.:" for c in value)
+        ):
+            return {"call_id": value, "call_id_source": "header"}
+    return {"call_id": uuid4().hex, "call_id_source": "generated"}
+
+
+def _dialect(call: RelayCall) -> str | None:
+    value = str(getattr(call.dialect, "value", call.dialect))
+    return value if value in USAGE_DIALECTS else None
 
 
 def _refusal_code(refused: str | None) -> str | None:
