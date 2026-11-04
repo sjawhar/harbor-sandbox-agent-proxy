@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Adds optional per-trial `harbor-growth/1` token accounting, validated whole-request reservations, ordered commits, and durable journal recovery.
+- Adds trusted task budget requirements, result classification that retains grades, and offline replay and measurement-gate tools. No budget is enabled by default.
+
 ## 0.1.2
 
 - Records each installed agent caller key before setup and preserves it through relay shutdown so host redaction covers setup-only trials.

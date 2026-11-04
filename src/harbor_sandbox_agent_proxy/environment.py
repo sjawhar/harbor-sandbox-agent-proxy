@@ -30,7 +30,7 @@ from harbor.utils.import_path import import_class
 from .config import RelayConfig
 from .outcome import EventSink, JsonOutcomeSink, RelayOutcome, TrialIdentity
 from .routing import ModelCall, Route, default_protected_values, default_route
-from .task_metadata import BridgedMcpServer, read_bridged_servers
+from .task_metadata import BridgedMcpServer, read_bridged_servers, check_token_budget
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +358,7 @@ class RelayEnvironment(BaseEnvironment):
         ):
             raise SeparateVerifierEnvironmentError(SEPARATE_VERIFIER_UNSUPPORTED)
         self.config = RelayConfig.model_validate(relay)
+        check_token_budget(environment_dir.parent, self.config.token_budget)
         protected = self.protected_values()
         resolved_task_env = (
             resolve_env_vars(task_env_config.env) if task_env_config.env else {}
@@ -482,6 +483,8 @@ class RelayEnvironment(BaseEnvironment):
 
     def attach_relay(self, relay: _RelayPhase) -> None:
         """Associate this trial's installed-agent relay with its environment."""
+        if getattr(relay, "config", self.config).token_budget != self.config.token_budget:
+            raise ValueError("agent and environment token_budget configurations disagree")
         self.relay = relay
 
     def record_runner_loop_outcome(self, outcome: RelayOutcome) -> None:

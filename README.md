@@ -104,6 +104,92 @@ harbor run --config job.json --yes --plugin sandbox-agent-proxy
 The included e2e suite drives this command against Harbor's Docker environment and
 checks the recorded outcome.
 
+## Per-trial token accounting
+
+Set `relay.token_budget` on **both** wrappers to enable accounting. Omit it to keep
+the existing forwarding and recording surface unchanged. A budget covers every
+agent-phase model, root and worker in the trial, across phase swaps; verifier calls
+are metered but do not spend the agent allocation.
+
+```json
+{
+  "limit": 10000000,
+  "rule": "harbor-growth/1",
+  "overshoot": "none",
+  "unknown_usage": "stop",
+  "enforce": false,
+  "hsap_commit": "<exact deployed source commit>",
+  "output_ceiling": {"claude-sonnet-4-5": 64000},
+  "profiles": {
+    "claude-sonnet-4-5": {
+      "id": "anthropic-messages/claude-sonnet-4-5/text",
+      "credit": "none",
+      "bound_source": "<provider input/output contract>",
+      "bound_version": "<frozen contract version>",
+      "route_injected_tokens_max": 0,
+      "route_bound_source": "<trusted gateway configuration>",
+      "route_bound_version": "<gateway configuration version>"
+    }
+  },
+  "inject_output_limit": true
+}
+```
+
+Replace the contract identifiers and ceilings with independently established
+bounds for the actual routed model and gateway. This example is **shadow mode**,
+not evidence that its model limits or injection bound hold. M3 must pass before
+an enforced canary. `credit: eligible` additionally requires `credit_evidence`
+from the model/mode's M2 exercise. With `credit: none`, every prompt is charged
+again: the resulting allocation is not comparable to a credited growth budget.
+
+Admission reserves all final forwarded UTF-8 JSON bytes plus the trusted gateway
+injection maximum and every branch's output allowance. It never subtracts prompt
+credit. `overshoot: none` stops when the next reservation cannot fit;
+`one_call` permits one crossing request only with no outstanding holds.
+`max_reservation` defaults to the trial limit; a larger valid request is a policy
+refusal, not an arithmetic defect. `unknown_usage: bound` charges missing
+components at their bounds; `stop` also fences further admission.
+
+Text and client tool protocols are supported, including Responses client
+tool-search and additional-tools items. Images, files, server-held conversation
+continuations and server compaction are refused before confinement. Opaque
+Responses reasoning requires `effective_input_tokens_max` in its profile;
+ciphertext bytes are not a token bound. Outside-output thinking requires a
+`thinking_ceiling`, and is multiplied per branch unless the profile explicitly
+declares an aggregate contract. Payload key order, nulls and values survive
+hashing. Only the documented cache-control envelope paths and message
+string-versus-text-block forms are normalized.
+
+The task can fail closed at startup:
+
+```toml
+[metadata.sandbox_agent_proxy]
+token_budget_required = true
+token_budget_limit = 10000000
+```
+
+The host writes `sandbox-agent-proxy/budget.jsonl` with a durable admission before
+each send, then settlement and admission-ordered commit events. Unsafe observed
+settlements fence admission immediately, even while an earlier call delays their
+commit. Usage records can therefore say `settled_pending_commit`, with null
+charge/spend fields. The journal supplies the eventual facts, keyed by ledger,
+call and attempt. No bodies are retained for a delayed commit. `budget.json` is
+only a snapshot cache. Read with `harbor_sandbox_agent_proxy.budget.read_budget`;
+missing/torn/nonclosed journals are incomplete regardless of the snapshot.
+An active writer owns an exclusive lock. Reusing a trial directory requires an
+explicit `TrialBudget(..., new_ledger=True)`, which preserves the old generation.
+
+`classify_ending` checks trusted launch identity and separates natural completion,
+intentional limit/insufficient-budget endings, accounting-censored results and
+runner failures. All retain any available grade. Budget endings require a durable
+refusal bound to the native terminal error, not an unrelated HTTP 400.
+
+The cap is conditional on the provider/gateway input and output bounds. A measured
+bound violation is a fail-stop detector, not prevention of an already-incurred
+overrun. `peak_context_per_root` and `carried_context` are diagnostics, never
+conversion factors or platform-equivalence claims. The independent offline oracle
+and the unexecuted M1–M3/G1–G5 operating gates are in [RUNBOOK.md](RUNBOOK.md).
+
 ## Development
 
 ```bash

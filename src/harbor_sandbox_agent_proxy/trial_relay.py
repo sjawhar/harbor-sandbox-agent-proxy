@@ -30,6 +30,7 @@ import pydantic
 from inspect_ai.agent import BridgedToolsSpec
 
 from . import model_events
+from .budget import TrialBudget
 from .config import RelayConfig
 from .connection import AgentConnection, served_connection_env
 from .conversation import BridgeConversationSelector
@@ -78,6 +79,7 @@ class TrialRelay:
     verifier_conversation: dict[str, pydantic.JsonValue] | None = None
     refusal_reason: str | None = None
     record_error: Exception | None = None
+    budget: TrialBudget | None = dataclasses.field(default=None, init=False)
     _answered_agent_calls: int = 0
     _counts: dict[str, int] = dataclasses.field(
         default_factory=lambda: {
@@ -105,6 +107,14 @@ class TrialRelay:
         if self.port is None:
             self.port = self.config.port
         self._caller_keys.update((self.agent_key, self.verifier_key))
+        if self.config.token_budget is not None:
+            self.budget = TrialBudget(self.config.token_budget,
+                                      self.trial.directory / "sandbox-agent-proxy", self.trial.name,
+                                      on_error=self._budget_error)
+
+    def _budget_error(self, error: Exception) -> None:
+        if self.record_error is None:
+            self.record_error = error
 
     @property
     def caller_keys(self) -> frozenset[str]:
@@ -211,6 +221,11 @@ class TrialRelay:
 
     async def close(self) -> RelayOutcome:
         """Stop the proxy and return every fact the host-side environment needs."""
+        if self.budget is not None:
+            try:
+                await self.budget.close_out()
+            except Exception as error:
+                self._budget_error(error)
         task, self._proxy_task = self._proxy_task, None
         stop, self._proxy_stop = self._proxy_stop, None
         if stop is not None:
@@ -254,6 +269,7 @@ class TrialRelay:
             record_error=repr(self.record_error)
             if self.record_error is not None
             else None,
+            budget=self.budget.record() if self.budget is not None else None,
         )
 
     def current_policy(self) -> tuple[RelayPhase, RelayPolicy]:
@@ -310,6 +326,8 @@ class TrialRelay:
                                 self.route,
                                 record=self.record,
                                 client=client,
+                                budget=self.budget,
+                                usage_only=self.config.record == "usage",
                             ),
                             port=self.port,
                             bridged_tools=self._bridged_tools,
@@ -445,6 +463,10 @@ class TrialRelay:
                 "response_bytes": len(json.dumps(call.response).encode("utf-8")),
                 "recorded_bytes": len(call.model_dump_json().encode("utf-8")),
             }
+            if call.budget is not None:
+                line["budget"] = call.budget
+                line["call_id"] = call.budget["call_id"]
+                line["refused"] = call.budget.get("refusal_code") or line["refused"]
             self._append_usage_line(line)
         except Exception as error:
             if self.record_error is None:
@@ -560,6 +582,10 @@ USAGE_REFUSAL_CODES = frozenset(
         "request_too_large",
         "request_rejected",
         "tool_outside_agent_phase",
+        "token_budget", "token_budget_insufficient", "token_budget_wait", "budget_closed",
+        "usage_unknown", "unsupported_input", "unsupported_model_profile",
+        "output_limit_required", "invalid_request_value", "invalid_reservation",
+        "reservation_too_large", "unbounded_thinking", "bound_violated",
     }
 )
 

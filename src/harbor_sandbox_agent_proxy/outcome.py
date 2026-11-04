@@ -45,6 +45,7 @@ class RelayOutcome:
     runner_atif: Path | None
     runner_atif_sha256: str | None
     record_error: str | None
+    budget: dict[str, object] | None = None
 
 
 class EventSink(Protocol):
@@ -92,6 +93,8 @@ class JsonOutcomeSink:
             "runner_atif_sha256": outcome.runner_atif_sha256,
             "record_error": outcome.record_error,
         }
+        if outcome.budget is not None:
+            payload["budget"] = outcome.budget
         destination.write_text(
             json.dumps(_redact(payload, self.protected()), sort_keys=True),
             encoding="utf-8",

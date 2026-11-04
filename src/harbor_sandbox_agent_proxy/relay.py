@@ -109,6 +109,7 @@ import httpx
 import pydantic
 from inspect_ai.agent._bridge._errors import PROVIDER_ERROR_KEY
 
+from .budget import BudgetRefused, TrialBudget, UsageMeter, serialize
 from .routing import ModelCall, RequestDialect, RouteCall, RouteRefused, endpoint_url
 
 if TYPE_CHECKING:
@@ -406,6 +407,7 @@ class RelayCall(pydantic.BaseModel):
     authenticated: bool = True
     stripped: list[str] = []
     refused: str | None = None
+    budget: dict[str, pydantic.JsonValue] | None = pydantic.Field(default=None, exclude_if=lambda v: v is None)
 
 
 # Receives each call the relay exchanged or refused, as the call completes.
@@ -443,6 +445,8 @@ class _Forwarder:
     route: RouteCall
     record: RecordCall
     client: httpx.AsyncClient
+    budget: TrialBudget | None = None
+    usage_only: bool = False
     usage: dict[RelayPhase, _PhaseUsage] = dataclasses.field(
         default_factory=lambda: {"agent": _PhaseUsage(), "verifier": _PhaseUsage()}
     )
@@ -471,9 +475,11 @@ def relay_methods(
     *,
     record: RecordCall,
     client: httpx.AsyncClient,
+    budget: TrialBudget | None = None,
+    usage_only: bool = False,
 ) -> dict[str, GenerateMethod]:
     """Build the four ``generate_*`` handlers for a host-provided ``route``."""
-    forwarder = _Forwarder(policy=policy, route=route, record=record, client=client)
+    forwarder = _Forwarder(policy=policy, route=route, record=record, client=client, budget=budget, usage_only=usage_only)
     endpoints = (
         _Endpoint(
             "generate_anthropic",
@@ -545,6 +551,13 @@ class _Call:
         self._wire_model: str | None = _model_name(json_data)
         self._model: str | None = None
         self._json_data: dict[str, pydantic.JsonValue] = json_data
+        self._budget = forwarder.budget if self._phase == "agent" else None
+        self._compact_record = forwarder.budget is not None and forwarder.usage_only
+        self._budget_attempts: list[dict] = []
+        self._budget_code: str | None = None
+        self._budget_status = 400
+        self._call_id = secrets.token_hex(16)
+        self._plan = None
 
     async def forward(self) -> dict[str, pydantic.JsonValue]:
         method = self._endpoint.method
@@ -564,6 +577,10 @@ class _Call:
         stripped: list[str] = []
         try:
             body = self._json_data
+            if self._budget is not None:
+                if self._budget.config.enforce and (self._budget.latch_cause or self._budget.admission_fence):
+                    self._budget.refuse(self._call_id, self._budget.latch_cause or self._budget.admission_fence, 0)
+                self._budget.validate_surface(self._endpoint.dialect, body)
             stripped = self._endpoint.confine(body, self._policy)
             route = await self._forwarder.route(
                 ModelCall(
@@ -576,6 +593,12 @@ class _Call:
             if body.get("model") != self._model:
                 body["model"] = self._model
             self._endpoint.normalize(body)
+            if self._budget is not None:
+                self._plan = self._budget.prepare(self._endpoint.dialect, self._model, body)
+        except BudgetRefused as refusal:
+            self._budget_status = refusal.status
+            self._budget_code = refusal.code
+            return await self._refuse(f"{method}: {refusal}", request={"__refused__": refusal.code})
         except RouteRefused as refusal:
             return await self._refuse(
                 f"{method}: {refusal}",
@@ -613,6 +636,11 @@ class _Call:
             for key, value in headers.items()
             if key.lower() not in _AUTH_HEADER_NAMES
         }
+        if self._forwarder.budget is not None:
+            for key, value in recorded_headers.items():
+                if key.lower() == "x-bet-eval-call-id" and 0 < len(value) <= 128 and all(c.isalnum() or c in "-_.:" for c in value):
+                    self._call_id = value
+                    break
 
         # 4) Reserve this request synchronously before the first await. Python cannot
         # interleave another request between this reservation and the gateway await, so a
@@ -631,7 +659,10 @@ class _Call:
         recorded = False
         try:
             status, resp_body = await _send_with_retries(
-                method, self._forwarder.client, url, body, headers, self._endpoint
+                method, self._forwarder.client, url, body, headers, self._endpoint,
+                budget=self._budget, plan=self._plan, call_id=self._call_id,
+                budget_facts=self._budget_attempts,
+                meter_enabled=self._forwarder.budget is not None,
             )
             await self._emit(
                 status,
@@ -655,6 +686,10 @@ class _Call:
                 status, _upstream_message(method, status, resp_body), resp_body
             )
             return {PROVIDER_ERROR_KEY: payload}
+        except BudgetRefused as refusal:
+            self._budget_status = refusal.status
+            self._budget_code = refusal.code
+            return await self._refuse(f"{method}: {refusal}", request={"__refused__": refusal.code})
         finally:
             if not recorded:
                 self._release_reservation(reservation_bytes)
@@ -668,7 +703,9 @@ class _Call:
         stripped: list[str] | None = None,
     ) -> dict[str, pydantic.JsonValue]:
         """Answer with a provider error; record the refusal unless the phase is over its caps."""
-        payload = _error_payload(None, message, None)
+        payload = _error_payload(self._budget_status if self._budget_code else None, message, None)
+        if self._budget_code:
+            payload["code"] = self._budget_code
         if not self._over_caps():
             await self._emit(
                 None,
@@ -709,8 +746,15 @@ class _Call:
             authenticated=authenticated,
             stripped=stripped or [],
             refused=refused,
+            budget=(dict(phase=self._phase, call_id=self._call_id, refusal_code=self._budget_code,
+                         attempts=self._budget_attempts) if self._forwarder.budget is not None else None),
         )
         await self._forwarder.record(call)
+        if self._compact_record:
+            if reservation_bytes is None:
+                self._usage.calls += 1
+            self._usage.recorded_bytes = self._forwarder.budget.recorded_bytes()
+            return
         actual_bytes = len(call.model_dump_json().encode("utf-8"))
         if reservation_bytes is None:
             self._usage.calls += 1
@@ -727,11 +771,13 @@ class _Call:
 
     def _caps_refusal(self, request_size: int) -> str | None:
         """The per-phase cap this call breaches, or ``None`` when it is within every cap."""
+        if self._compact_record:
+            self._usage.recorded_bytes = self._forwarder.budget.recorded_bytes()
         if self._usage.calls >= self._policy.max_calls:
             return f"per-phase call cap of {self._policy.max_calls} reached"
         if (
             self._usage.recorded_bytes > 0
-            and self._usage.recorded_bytes + request_size
+            and self._usage.recorded_bytes + (0 if self._compact_record else request_size)
             > self._policy.max_recorded_bytes
         ):
             return f"per-phase recorded-byte cap of {self._policy.max_recorded_bytes} reached"
@@ -748,13 +794,13 @@ class _Call:
         if cap is not None:
             return cap
         self._usage.calls += 1
-        self._usage.recorded_bytes += request_bytes
+        self._usage.recorded_bytes += 0 if self._compact_record else request_bytes
         return None
 
     def _release_reservation(self, request_bytes: int) -> None:
         """Undo an in-flight reservation whose call never reached the recorder."""
         self._usage.calls -= 1
-        self._usage.recorded_bytes -= request_bytes
+        self._usage.recorded_bytes -= 0 if self._compact_record else request_bytes
 
 
 async def _send_with_retries(
@@ -764,48 +810,60 @@ async def _send_with_retries(
     body: dict[str, pydantic.JsonValue],
     headers: dict[str, str],
     endpoint: _Endpoint,
+    *,
+    budget: TrialBudget | None = None,
+    plan=None,
+    call_id: str = "",
+    budget_facts: list[dict] | None = None,
+    meter_enabled: bool = False,
 ) -> tuple[int | None, pydantic.JsonValue]:
-    """POST ``body`` with bounded retries; return the final ``(status, response-body)``.
-
-    Streams the request and assembles the complete response whenever the agent's own
-    request asks for one (``stream`` true) or the provider is Google, whose handler is
-    never told which endpoint the sandboxed client itself called. Every other call is a
-    single unstreamed POST.
-
-    Retries a transport error, a timeout, a retryable status (408/409/429/5xx) -- a
-    streamed call's assembly failure included, via the status ``_StreamAssemblyError``
-    carries -- with capped exponential backoff, honouring an upstream ``retry-after``. On
-    exhaustion a timeout maps to HTTP 504 and any other transport error to HTTP 502 (never
-    ``None``), so a reader can tell a gateway failure from a request the forwarder never
-    addressed.
-    """
+    """Each HTTP attempt owns its own durable admission and raw usage meter."""
     streaming = endpoint.provider is _Provider.GOOGLE or body.get("stream") is True
     last_transport: tuple[int, str] | None = None
     for attempt in range(_MAX_ATTEMPTS):
+        meter = UsageMeter(endpoint.dialect, plan.branches if plan else 1, streaming) if meter_enabled else None
+        item = await budget.admit(plan, call_id, attempt + 1) if budget is not None else None
+        connect_failed, sent, status, retry_after = False, False, None, None
+        retry = True
         try:
+            sent = True
             if streaming:
                 status, resp_body, retry_after = await _send_stream(
-                    client, url, body, headers, endpoint.assemble_stream
+                    client, url, body, headers, endpoint.assemble_stream,
+                    meter=meter, wire=plan.wire if plan else None,
                 )
             else:
-                response = await client.post(url, json=body, headers=headers)
+                response = await client.post(url, content=plan.wire, headers={"content-type": "application/json", **headers}) if plan else await client.post(url, json=body, headers=headers)
                 status = response.status_code
                 resp_body = _response_body(response)
                 retry_after = response.headers.get("retry-after")
+                if meter is not None:
+                    meter.observe(resp_body)
+            retry = status in _RETRY_STATUSES or 500 <= status < 600
         except httpx.TimeoutException as exc:
+            connect_failed = isinstance(exc, httpx.ConnectTimeout)
             last_transport = (504, f"{method}: gateway timed out: {exc}")
         except httpx.HTTPError as exc:
+            connect_failed = isinstance(exc, httpx.ConnectError)
             last_transport = (502, f"{method}: gateway transport error: {exc}")
-        else:
-            retryable = status in _RETRY_STATUSES or 500 <= status < 600
-            if not retryable or attempt == _MAX_ATTEMPTS - 1:
-                return status, resp_body
-            await anyio.sleep(_retry_delay(attempt, retry_after))
-            continue
+        finally:
+            if meter is not None:
+                usage = meter.measurement()
+                if item is not None:
+                    facts = budget.settle(item, usage, sent=sent,
+                                          status=getattr(meter, "http_status", status),
+                                          connect_failed=connect_failed)
+                else:
+                    facts = dict(state="verifier", n=usage.n, o=usage.o, charge=0,
+                                 attempt=attempt + 1, rule="harbor-growth/1")
+                if budget_facts is not None:
+                    budget_facts.append(facts)
+        if status is not None and (not retry or attempt == _MAX_ATTEMPTS - 1):
+            return status, resp_body
         if attempt == _MAX_ATTEMPTS - 1:
             break
-        await anyio.sleep(_retry_delay(attempt, None))
-    assert last_transport is not None  # the loop only breaks after a transport failure
+        await anyio.sleep(_retry_delay(attempt, retry_after))
+    assert last_transport is not None
     status, message = last_transport
     return status, {"error": {"message": message}}
 
@@ -816,6 +874,9 @@ async def _send_stream(
     body: dict[str, pydantic.JsonValue],
     headers: dict[str, str],
     assemble: _StreamAssembler,
+    *,
+    meter: UsageMeter | None = None,
+    wire: bytes | None = None,
 ) -> tuple[int, pydantic.JsonValue, str | None]:
     """POST ``body`` as a stream; return ``(status, assembled-or-error body, retry-after)``.
 
@@ -828,9 +889,16 @@ async def _send_stream(
     (``_StreamAssemblyError``) becomes the failed call its status implies, carrying no
     ``retry-after`` (the initial 2xx headers never had one).
     """
-    async with client.stream("POST", url, json=body, headers=headers) as response:
+    send = {"json": body} if wire is None else {"content": wire}
+    if wire is not None:
+        headers = {"content-type": "application/json", **headers}
+    async with client.stream("POST", url, **send, headers=headers) as response:
+        if meter is not None:
+            meter.http_status = response.status_code
         if not (200 <= response.status_code < 300):
             await response.aread()
+            if meter is not None:
+                meter.observe(_response_body(response))
             return (
                 response.status_code,
                 _response_body(response),
@@ -839,9 +907,15 @@ async def _send_stream(
         content_type = response.headers.get("content-type", "")
         if not content_type.startswith("text/event-stream"):
             await response.aread()
+            if meter is not None:
+                meter.observe(_response_body(response))
             return response.status_code, _response_body(response), None
         try:
-            events = [event async for event in _iter_sse_events(response)]
+            events = []
+            async for event in _iter_sse_events(response):
+                if meter is not None:
+                    meter.feed(event)
+                events.append(event)
             assembled = assemble(events)
         except _StreamAssemblyError as exc:
             return exc.status, exc.body, None

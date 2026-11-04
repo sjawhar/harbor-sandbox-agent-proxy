@@ -1033,6 +1033,10 @@ def test_usage_refusal_codes_are_the_shared_set() -> None:
         "request_too_large",
         "request_rejected",
         "tool_outside_agent_phase",
+        "token_budget", "token_budget_insufficient", "token_budget_wait", "budget_closed",
+        "usage_unknown", "unsupported_input", "unsupported_model_profile",
+        "output_limit_required", "invalid_request_value", "invalid_reservation",
+        "reservation_too_large", "unbounded_thinking", "bound_violated",
     }
 
 

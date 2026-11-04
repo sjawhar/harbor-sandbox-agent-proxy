@@ -258,6 +258,8 @@ class RelayAgent(harbor_agent_base.BaseAgent):
         environment = _relay_environment(environment)
         if self._connection is None:
             raise RuntimeError("only installed agents open a sandbox relay")
+        if environment.config.token_budget != self._config.token_budget:
+            raise ValueError("agent and environment token_budget configurations disagree")
         sink = await environment.open_sink()
         servers = await environment.bridged_tool_servers()
         relay = TrialRelay(

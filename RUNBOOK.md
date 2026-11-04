@@ -1,0 +1,214 @@
+# Token-budget operating gates
+
+## State and limits
+
+M1, M2, M3 and G1–G5 have **not been run** by this implementation. No live model
+calls, deployment, enforced canary, sync-sidecar isolation test, or platform parity
+measurement is authorized by passing the offline suite.
+
+The cap assumes the selected provider/gateway contracts actually bound input,
+all candidates' output and outside-output thinking. Measured counterexamples
+fence the ledger; they do not undo an overrun. E1 remains unconfirmed: the stored
+Claude fixture has a 1,576-byte first request and reports 9,838 prompt tokens.
+It cannot establish a bound on the final wire body of the deployed route. Never
+fit an injection allowance to those observations.
+
+Native Google caller authentication (F3) remains open on the inspected bridge.
+This package does not repair its dropped request headers. Do not claim it fixed
+from an offline direct-handler test. Do not remove a lane's old relay until that
+lane passes G1–G5. M1 alone permits a platform-comparison claim. M2 alone permits an
+empirical credit-eligible profile for its frozen model/mode.
+
+## Offline regression commands
+
+Run in this checkout, with its frozen optional dependencies installed. Each Python
+process is memory-capped and niced. `DOCKER_CONFIG` is a fresh empty directory.
+
+```sh
+( ulimit -v 6291456; nice -n 19 uv sync --all-extras --group dev --frozen )
+( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) nice -n 19 uv run pytest )
+( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) nice -n 19 uv run pytest tests/test_budget*.py )
+( ulimit -v 6291456; DOCKER_CONFIG=$(mktemp -d) BUDGET_RULES=v2 nice -n 19 uv run pytest tests/test_budget.py -k '71 or 72 or 74 or 79' )
+```
+
+The last command is an intentional negative control: it must exit 1 with **four
+behavioral failures**, not import/config/collection errors. The test-only v2 stub
+omits paid roots, admits negative holds, requires an exhaustion witness for
+natural success, and commits in response order. The same four tests without
+`BUDGET_RULES=v2` must pass. The descending duplicate example is **600**, not 300.
+
+These are offline controls. Original design tests 54, 56, 58, 64, 66–67, 69–70
+require the actual lane CLI, builder, native queue, result reader, Job or complete
+real trajectory; their lane-facing acceptance remains unexecuted here. Test 88's
+synthetic bound detector does not execute real M3. Deleted/superseded tests (15,
+26, 39–40, 44, 65) follow the v3 replacements, not the v2 oracle.
+
+## Artifact contracts
+
+Freeze selections, model/API/CLI versions, route/profile and tolerance **before**
+measuring. Keep exports in a private location outside this public source tree.
+The commands below read JSONL artifacts; no command makes a model call itself.
+A failure or empty export is not a passed gate.
+
+- `REPLAY_JSONL`: one row per admitted attempt, with `admit_seq`, `root` (the full
+  semantic root, routed model and dialect included), complete request `messages`,
+  raw `n`, `o`, optional iteration `w`, `committed_charge` joined from the journal,
+  and `old_charge` where the lane has an old relay. Every old-ledger difference
+  must have a nonempty `difference_cause`. Do not derive the oracle's expected
+  charge using production identity/credit helpers. The replay tool normalizes
+  Anthropic/Chat message cache-control envelopes; other dialect exports must
+  preserve their own supported message representation.
+- `M1_JSONL`: per aligned turn: `attempt`, `platform_charge`, `candidate_charge`,
+  `selection_frozen`, `versions_frozen`, `worker_attribution: matched`, `reset`,
+  `workers`, `non_anthropic`, `held_out`. Derive platform deltas from consecutive
+  `TokenBudgetBlock.precalculated_total_tokens_remaining` values; reconcile the
+  initial allocation and final output with `tokens_consumed`. Missing system,
+  tools, thinking or worker attribution is unidentifiable, not zero. Compare
+  candidate rules that differ and retain per-turn residuals. The tool's residual
+  sign check is a minimum screen, not a substitute for examining systematic
+  per-turn/reset bias.
+- `M2_JSONL`: at least 30 real-route calls of one frozen model/mode, with `n`,
+  `extends_previous`, provider-counted `tail_tokens`, `thinking_present` and
+  `thinking_dropped`. Include retained and omitted earlier reasoning/thinking.
+- `M3_JSONL`: actual successful shadow calls with `final_body_bytes`, `r_in`, raw
+  `n`, `o`, `terminal`, `successful`, `real_route`, `profile`, `bound_source`,
+  `bound_version`, `route_bound_source`, `route_bound_version`,
+  `tools_transition`, `thinking_transition`; opaque-reasoning rows additionally
+  name `effective_input_contract`. Count bytes **after** confinement, routed-model
+  normalization, limit injection and Chat usage normalization, from the same
+  representation actually sent. Bounds and injection allowance come from trusted
+  configuration, not sample fitting. Stand-in usage (including the Codex capture
+  server's canned counts of 1) must set `real_route: false` and cannot pass M3.
+
+## M1 — comparative reporting only (unrun)
+
+Coverage: at least five attempts with reset/auto-compaction, at least two with
+workers, at least two non-Anthropic attempts where available, and a held-out third
+never used for fitting. Held-out attempt agreement must be within 1%; inspect
+per-turn residuals for systematic sign and reset errors. Disable workers for a
+matched measurement or report the comparison unavailable. A passing growth
+fixture, or a +12.3% conversion, is not an identification of the platform.
+
+```sh
+: "${M1_JSONL:?frozen aligned real platform/Harbor measurements}"
+( ulimit -v 6291456; nice -n 19 uv run python -m tests.budget_replay m1 "$M1_JSONL" )
+```
+
+## M2 — per-model/mode credit eligibility (unrun)
+
+A single prefix-rendering violation keeps the profile at `credit: none`.
+Choose and record the framing tolerance before examining the result. A passing
+sample is empirical support for this route/model/mode, not a universal proof.
+
+```sh
+: "${M2_JSONL:?real-route retained/dropped-thinking trajectory}"
+: "${FRAMING_TOLERANCE:?predeclared nonnegative token tolerance}"
+( ulimit -v 6291456; nice -n 19 uv run python -m tests.budget_replay m2 "$M2_JSONL" --framing-tolerance "$FRAMING_TOLERANCE" )
+```
+
+## M3 — per-profile shadow input-bound check (unrun)
+
+First run a lane shadow with both wrappers using `enforce: false` and the actual
+bound/injection source versions. Keep all final-body byte/usage evidence and
+export it under the schema above. Require nonzero successful raw usage, tool and
+thinking transitions, and `n <= r_in` on every call. Ordinary text measurements
+do not enable opaque reasoning without an independent effective-input contract.
+Keep unbounded Gemini modes disabled. A counterexample blocks the canary.
+
+```sh
+: "${SHADOW_JOB:?lane-built Harbor shadow job JSON}"
+# LIVE MODEL CALLS: do not execute as part of implementation verification.
+( ulimit -v 6291456; nice -n 19 uv run harbor run --config "$SHADOW_JOB" --yes --plugin sandbox-agent-proxy )
+: "${M3_JSONL:?trusted final-body/raw-usage export from that shadow}"
+( ulimit -v 6291456; nice -n 19 uv run python -m tests.budget_replay m3 "$M3_JSONL" )
+```
+
+## G1 — independent replay per lane (unrun)
+
+Replay whole recorded trials, including real auto-compaction. Join committed
+facts by ledger/call/attempt, not pending usage records' null charges. Classify
+every difference from the old scalar; do not demand equality with it. Report
+new-root first-use charges, same-root resets, re-sent output, branch/iteration
+work, credit invalidations, bound/partial charges and the graded cutoff. Do not
+size a limit by multiplying a diagnostic.
+
+```sh
+: "${REPLAY_JSONL:?complete frozen lane trial export}"
+: "${REPLAY_CREDIT:?none or eligible as actually launched}"
+( ulimit -v 6291456; nice -n 19 uv run python -m tests.budget_replay replay "$REPLAY_JSONL" --credit "$REPLAY_CREDIT" )
+```
+
+## G2 — native refusal and grade preservation per lane (unrun)
+
+Use the lane's actual pinned CLI (Claude Code 2.1.309 or agy 1.4.12 for the design's
+controls), native sandbox-service queue, and final verifier. Exercise unary 400
+and post-200 SSE errors. An unchanged conversation, changed-content near miss,
+exhaustion control and known-good natural submission must give the distinct
+expected outcomes. Keep the actual submission and grade after exhaustion. A
+queue client disconnect must still leave measured accounting. Exercise native
+Google correct/missing/wrong/foreign keys; missing/wrong keys must never reach
+routing before F3 can be called closed. Pin the bridge build in that evidence.
+
+```sh
+: "${G2_JOB:?lane-built native-CLI control job, verifier enabled}"
+( ulimit -v 6291456; nice -n 19 uv run harbor run --config "$G2_JOB" --yes --plugin sandbox-agent-proxy )
+```
+
+Repeat that exact invocation for each lane-built positive and negative control
+configuration. The lane must run its result reader over those outputs. Its
+builder, native-terminal extraction and grader are not implemented in this
+repository; no made-up generic shell flag substitutes for those lane commands.
+
+## G3 — real builder/result-reader contract (unrun)
+
+The lane supplies its **existing exact** build and reader commands, including
+farm-tunnel and stale-pin/tarball paths. They must refuse omitted/shadow/wrong
+budgets unless explicitly stamped as shadow experiments; wrappers must agree.
+The reader uses `read_budget` and `classify_ending`, binds trusted launch identity,
+configuration hash, source commit, limit and profiles, and keeps every available
+grade. Test natural success, ordinary agent failure, real runner failure, limit,
+insufficient, process-death/nonclosed journals, and material uncertainty. Copied
+snapshots, malformed/unrelated terminal errors and wrong identities cannot
+supply the exhaustion witness.
+
+```sh
+: "${LANE_BUILD_COMMAND:?exact approved lane builder invocation}"
+: "${LANE_READER_COMMAND:?exact approved lane result-control invocation}"
+bash -euc "$LANE_BUILD_COMMAND"
+bash -euc "$LANE_READER_COMMAND"
+```
+
+These variables are prerequisites, not claims that a missing lane integration is
+implemented here. Local wrapper tests exercise only this package's boundary.
+
+## G4 — real Job and sync/sentinel isolation (unrun)
+
+The lane's real Job must use a Secret reference in `main` only; never fetch a real
+key for this test. Use a fresh sentinel. Sync mounts only the export subpath,
+not runner inputs, the Docker root or its socket. Test both the sandbox agent
+surface and sync. The runner, egress sidecar, operators and principals able to
+read/mount the Secret remain trusted.
+
+```sh
+: "${LANE_SENTINEL_COMMAND:?exact approved real-Job sentinel/isolation test invocation}"
+bash -euc "$LANE_SENTINEL_COMMAND"
+```
+
+This test changes a deployment and is explicitly outside implementation work.
+An offline manifest inspection does not pass it.
+
+## G5 — bounded enforced canary (unrun)
+
+Only after that lane's G1–G4 **and real M3** pass: one enforced trial per lane,
+limit chosen to reach exhaustion, old relay retained as backstop where present.
+Check a complete durable record, native refusal binding, clean runner outcome
+and retained final grade. Only G1–G5 together allow production enablement and
+removal of that lane's old enforcing relay. No deployment correction or parity
+claim follows merely from running the command.
+
+```sh
+: "${CANARY_JOB:?reviewed bounded enforcing lane job after G1-G4/M3}"
+( ulimit -v 6291456; nice -n 19 uv run harbor run --config "$CANARY_JOB" --yes --plugin sandbox-agent-proxy )
+: "${LANE_READER_COMMAND:?exact lane reader invocation for this canary}"
+bash -euc "$LANE_READER_COMMAND"
+```

@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .budget import TokenBudgetConfig
 
 
 class RelayConfig(BaseModel):
@@ -29,6 +31,15 @@ class RelayConfig(BaseModel):
     # conversation. "usage" keeps neither: each call appends one line of token usage to
     # sandbox-agent-proxy/usage.jsonl, and the verifier's conversation is refused.
     record: Literal["full", "usage"] = "full"
+    token_budget: TokenBudgetConfig | None = Field(default=None, exclude_if=lambda value: value is None)
     conversation_path: PurePosixPath = PurePosixPath(
         "/tests/sandbox-agent-proxy/conversation.json"
     )
+
+    @model_validator(mode="after")
+    def budget_models(self):
+        if self.token_budget is not None:
+            routed = {model.split("/", 1)[-1] for model in self.declared_models}
+            if routed != set(self.token_budget.output_ceiling):
+                raise ValueError("budget profiles must cover every routed declared model")
+        return self

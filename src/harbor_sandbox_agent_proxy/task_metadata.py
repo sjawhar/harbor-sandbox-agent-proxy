@@ -27,6 +27,8 @@ class _RelayMetadata(pydantic.BaseModel):
     model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="forbid")
 
     bridged_mcp_servers: list[BridgedMcpServer] = pydantic.Field(default_factory=list)
+    token_budget_required: pydantic.StrictBool = False
+    token_budget_limit: pydantic.StrictInt | None = pydantic.Field(default=None, gt=0)
 
 
 class _Metadata(pydantic.BaseModel):
@@ -50,3 +52,16 @@ def read_bridged_servers(task_dir: Path) -> tuple[BridgedMcpServer, ...]:
             parsed
         ).metadata.sandbox_agent_proxy.bridged_mcp_servers
     )
+
+
+def check_token_budget(task_dir: Path, budget) -> None:
+    """A trusted task can require an enforcing, exactly matching token allocation."""
+    if not (task_dir / "task.toml").is_file():
+        return
+    parsed = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
+    metadata = _TaskToml.model_validate(parsed).metadata.sandbox_agent_proxy
+    if metadata.token_budget_required and (
+        budget is None or not budget.enforce or metadata.token_budget_limit is None
+        or budget.limit != metadata.token_budget_limit
+    ):
+        raise ValueError("task requires an enforcing token budget with its declared limit")
