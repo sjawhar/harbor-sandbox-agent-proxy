@@ -417,6 +417,8 @@ class TrialRelay:
                 ):
                     self._answered_agent_calls += 1
                 usage = None if event.output is None else event.output.usage
+                if usage is None and event.error is not None:
+                    usage = await _error_usage(call)
                 await self.sink.record(event)
             line = {
                 **_call_id(call),
@@ -585,13 +587,120 @@ def _dialect(call: RelayCall) -> str | None:
     return value if value in USAGE_DIALECTS else None
 
 
-# Inspect's Google converter turns an absent promptTokenCount or candidatesTokenCount into
-# 0. A count the provider did not report as a non-negative integer (absent, a bool, a
-# negative, a float or a string) is written as null, never as a measured count.
-_GEMINI_REQUIRED_COUNTS = {
-    "input_tokens": "promptTokenCount",
-    "output_tokens": "candidatesTokenCount",
+# Each dialect's raw usage object and the provider fields its input and output counts
+# come from. A count the provider did not report as a non-negative integer (absent, a
+# bool, a negative, a float or a string) is written as null, never as a measured count:
+# Inspect's Google converter, for one, turns an absent count into 0.
+_RAW_USAGE: dict[RequestDialect, tuple[str, dict[str, str]]] = {
+    RequestDialect.MESSAGES: (
+        "usage",
+        {"input_tokens": "input_tokens", "output_tokens": "output_tokens"},
+    ),
+    RequestDialect.CHAT_COMPLETIONS: (
+        "usage",
+        {"input_tokens": "prompt_tokens", "output_tokens": "completion_tokens"},
+    ),
+    RequestDialect.RESPONSES: (
+        "usage",
+        {"input_tokens": "input_tokens", "output_tokens": "output_tokens"},
+    ),
+    RequestDialect.GEMINI: (
+        "usageMetadata",
+        {"input_tokens": "promptTokenCount", "output_tokens": "candidatesTokenCount"},
+    ),
 }
+
+# The smallest body each converter accepts around a raw usage object, so an error
+# response's usage is normalised by the same Inspect converter as an answered call's.
+_USAGE_ONLY_BODIES: dict[str, dict[str, pydantic.JsonValue]] = {
+    "generate_anthropic": {
+        "id": "usage",
+        "type": "message",
+        "role": "assistant",
+        "model": "usage",
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+    },
+    "generate_completions": {
+        "id": "usage",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "usage",
+        "choices": [],
+    },
+    "generate_responses": {
+        "id": "usage",
+        "object": "response",
+        "created_at": 0,
+        "model": "usage",
+        "output": [],
+        "status": "incomplete",
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+    },
+    "generate_google": {"candidates": []},
+}
+
+
+def _raw_usage(
+    call: RelayCall,
+) -> tuple[dict[str, pydantic.JsonValue], dict[str, str]] | None:
+    """The response's raw usage object and its required count fields, if it has one."""
+    try:
+        key, fields = _RAW_USAGE[RequestDialect(call.dialect)]
+    except (KeyError, ValueError):
+        return None
+    raw = call.response.get(key) if isinstance(call.response, dict) else None
+    return (raw, fields) if isinstance(raw, dict) else None
+
+
+def _is_count(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+_USAGE_SCHEMA_DEFAULTS: dict[str, dict[str, pydantic.JsonValue]] = {
+    "generate_completions": {"total_tokens": None},
+    "generate_responses": {
+        "total_tokens": None,
+        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": 0},
+    },
+}
+
+
+async def _error_usage(call: RelayCall) -> inspect_ai.model.ModelUsage | None:
+    """The usage an unanswered call's response reports, normalised as an answered call's.
+
+    Full recording keeps an error response's body, and its reader counts the usage the
+    body reports; usage mode must not drop those tokens. An invalid required count is
+    passed to the converter as 0 and written as null afterwards by ``_reported_counts``.
+    """
+    found = _raw_usage(call)
+    body = _USAGE_ONLY_BODIES.get(call.method)
+    if found is None or body is None:
+        return None
+    raw, fields = found
+    required: dict[str, int] = {
+        f: value if isinstance(value := raw.get(f), int) and _is_count(value) else 0
+        for f in fields.values()
+    }
+    usage: dict[str, pydantic.JsonValue] = {**raw, **required}
+    # Fields the SDK's usage schema requires but no count is read from; a provider's
+    # own value, when it sent one, is kept.
+    for name, default in _USAGE_SCHEMA_DEFAULTS.get(call.method, {}).items():
+        given = usage.get(name)
+        if isinstance(default, dict):
+            usage[name] = {**default, **(given if isinstance(given, dict) else {})}
+        elif name not in usage:
+            usage[name] = sum(required.values())  # a total
+    answer = {**body, _RAW_USAGE[RequestDialect(call.dialect)][0]: usage}
+    try:
+        output = await model_events._convert_response(call, answer)  # pyright: ignore[reportPrivateUsage]
+    except (ValueError, TypeError, KeyError):
+        return None
+    return output.usage
 
 
 def _reported_counts(
@@ -601,16 +710,17 @@ def _reported_counts(
         "input_tokens": None if usage is None else usage.input_tokens,
         "output_tokens": None if usage is None else usage.output_tokens,
     }
-    if call.dialect == RequestDialect.GEMINI and usage is not None:
-        metadata = (
-            call.response.get("usageMetadata")
-            if isinstance(call.response, dict)
-            else None
-        )
-        for key, field in _GEMINI_REQUIRED_COUNTS.items():
-            value = metadata.get(field) if isinstance(metadata, dict) else None
-            if type(value) is not int or value < 0:
-                counts[key] = None
+    if usage is None:
+        return counts
+    found = _raw_usage(call)
+    if found is None:
+        if call.dialect == RequestDialect.GEMINI:
+            return {"input_tokens": None, "output_tokens": None}
+        return counts
+    raw, fields = found
+    for key, field in fields.items():
+        if not _is_count(raw.get(field)):
+            counts[key] = None
     return counts
 
 
