@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Keeps one payload-free terminal receipt per phase when the recorded-byte cap refuses a call, including when payload recording is exhausted, and includes it in the JSON outcome.
+
 ## 0.1.2
 
 - Records each installed agent caller key before setup and preserves it through relay shutdown so host redaction covers setup-only trials.

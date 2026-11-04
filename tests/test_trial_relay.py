@@ -25,7 +25,12 @@ from harbor_sandbox_agent_proxy import model_events, trial_relay
 from harbor_sandbox_agent_proxy.config import RelayConfig
 from harbor_sandbox_agent_proxy.connection import AgentConnection, served_connection_env
 from harbor_sandbox_agent_proxy.outcome import EventSink, RelayOutcome, TrialIdentity
-from harbor_sandbox_agent_proxy.relay import RelayCall, RelayPhase, relay_methods
+from harbor_sandbox_agent_proxy.relay import (
+    GenerateMethod,
+    RelayCall,
+    RelayPhase,
+    relay_methods,
+)
 from harbor_sandbox_agent_proxy.routing import (
     ModelCall,
     RequestDialect,
@@ -810,6 +815,79 @@ async def test_a_later_step_reenters_the_agent_phase_and_is_checked_again(
         "second reply",
     ]
     assert outcome.answered_agent_calls == 2
+
+
+async def test_response_crossing_recorded_cap_keeps_a_terminal_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers: dict[str, GenerateMethod] = {}
+    forwarded: list[httpx.Request] = []
+    response = {
+        "id": "message-id",
+        "model": "claude-test",
+        "content": [{"type": "text", "text": "x" * 2048}],
+        "role": "assistant",
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "type": "message",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
+        return httpx.Response(200, json=response)
+
+    client_factory = httpx.AsyncClient
+
+    def client(*, timeout: httpx.Timeout) -> httpx.AsyncClient:
+        return client_factory(transport=httpx.MockTransport(upstream), timeout=timeout)
+
+    @contextlib.asynccontextmanager
+    async def proxy(
+        sandbox: object, *, methods: dict[str, GenerateMethod], **kwargs: object
+    ) -> AsyncGenerator[object]:
+        del sandbox, kwargs
+        handlers.update(methods)
+        yield types.SimpleNamespace(port=13131)
+
+    monkeypatch.setattr(trial_relay.httpx, "AsyncClient", client)
+    monkeypatch.setattr(trial_relay, "sandbox_model_proxy", proxy)
+    monkeypatch.setattr(trial_relay, "_wait_for_proxy", AsyncMock())
+    relay_instance = _relay(
+        settings=_settings(max_recorded_bytes=1024),
+        environment=MagicMock(spec=BaseEnvironment),
+    )
+    relay_instance.bridged_servers = ()
+    await relay_instance.open_agent_phase()
+    try:
+        generate = handlers["generate_anthropic"]
+        headers = {"x-api-key": relay_instance.agent_key}
+        started = datetime.datetime.now(datetime.UTC).timestamp()
+        first = await generate({"model": "claude-test", "messages": []}, headers)
+        refused = await generate({"model": "claude-test", "messages": []}, headers)
+    finally:
+        outcome = await relay_instance.close()
+
+    assert first == response
+    error = refused["__inspect_provider_error__"]
+    assert isinstance(error, dict)
+    assert error["message"] == (
+        "generate_anthropic: per-phase recorded-byte cap of 1024 reached"
+    )
+    assert len(forwarded) == 1
+    assert len(outcome.calls) == 1
+    receipts = outcome.terminal_receipts
+    assert len(receipts) == 1
+    assert receipts[0].kind == "relay_recorded_cap"
+    assert receipts[0].phase == "agent"
+    assert receipts[0].cap == 1024
+    assert receipts[0].recorded_bytes > 1024
+    assert (
+        started <= receipts[0].time <= datetime.datetime.now(datetime.UTC).timestamp()
+    )
+    assert receipts[0].recorded_bytes == len(
+        outcome.calls[0].model_dump_json().encode("utf-8")
+    )
 
 
 async def test_configured_policy_reaches_the_forwarder(tmp_path: Path) -> None:

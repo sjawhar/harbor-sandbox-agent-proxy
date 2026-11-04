@@ -124,6 +124,7 @@ __all__ = [
     "GenerateMethod",
     "PolicyGetter",
     "RecordCall",
+    "RecordedByteCapReceipt",
     "RelayCall",
     "RelayPhase",
     "RelayPolicy",
@@ -370,6 +371,19 @@ class RelayPolicy:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class RecordedByteCapReceipt:
+    """Payload-free evidence of a phase's first recorded-byte-cap refusal."""
+
+    phase: RelayPhase
+    time: float
+    recorded_bytes: int
+    cap: int
+    kind: Literal["relay_recorded_cap"] = dataclasses.field(
+        default="relay_recorded_cap", init=False
+    )
+
+
 class RelayCall(pydantic.BaseModel):
     """One request/response pair the forwarder exchanged with the gateway, or refused.
 
@@ -433,6 +447,7 @@ class _PhaseUsage:
 
     calls: int = 0
     recorded_bytes: int = 0
+    recorded_cap_receipt: bool = False
 
 
 @dataclasses.dataclass
@@ -443,6 +458,7 @@ class _Forwarder:
     route: RouteCall
     record: RecordCall
     client: httpx.AsyncClient
+    record_terminal_receipt: Callable[[RecordedByteCapReceipt], None] | None
     usage: dict[RelayPhase, _PhaseUsage] = dataclasses.field(
         default_factory=lambda: {"agent": _PhaseUsage(), "verifier": _PhaseUsage()}
     )
@@ -471,9 +487,16 @@ def relay_methods(
     *,
     record: RecordCall,
     client: httpx.AsyncClient,
+    record_terminal_receipt: Callable[[RecordedByteCapReceipt], None] | None = None,
 ) -> dict[str, GenerateMethod]:
-    """Build the four ``generate_*`` handlers for a host-provided ``route``."""
-    forwarder = _Forwarder(policy=policy, route=route, record=record, client=client)
+    """Build the four handlers, optionally reporting one recorded-cap receipt per phase."""
+    forwarder = _Forwarder(
+        policy=policy,
+        route=route,
+        record=record,
+        client=client,
+        record_terminal_receipt=record_terminal_receipt,
+    )
     endpoints = (
         _Endpoint(
             "generate_anthropic",
@@ -734,6 +757,17 @@ class _Call:
             and self._usage.recorded_bytes + request_size
             > self._policy.max_recorded_bytes
         ):
+            record_receipt = self._forwarder.record_terminal_receipt
+            if not self._usage.recorded_cap_receipt and record_receipt is not None:
+                self._usage.recorded_cap_receipt = True
+                record_receipt(
+                    RecordedByteCapReceipt(
+                        phase=self._phase,
+                        time=time.time(),
+                        recorded_bytes=self._usage.recorded_bytes,
+                        cap=self._policy.max_recorded_bytes,
+                    )
+                )
             return f"per-phase recorded-byte cap of {self._policy.max_recorded_bytes} reached"
         if request_size > self._policy.max_request_bytes:
             return (

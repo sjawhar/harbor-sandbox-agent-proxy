@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ from harbor_sandbox_agent_proxy.outcome import (
     RelayOutcome,
     TrialIdentity,
 )
+from harbor_sandbox_agent_proxy.relay import RecordedByteCapReceipt
 
 
 def _outcome(
@@ -59,6 +61,8 @@ def test_relay_outcome_keeps_relay_and_runner_loop_results_distinct() -> None:
     assert runner_loop.mode == "runner-loop"
     assert runner_loop.runner_atif == Path("/tmp/runner/trajectory.json")
     assert runner_loop.runner_atif_sha256 == "a" * 64
+    assert relay.terminal_receipts == ()
+    assert runner_loop.terminal_receipts == ()
 
 
 async def test_json_outcome_sink_writes_redacted_inspect_events(
@@ -98,3 +102,44 @@ async def test_json_outcome_sink_writes_redacted_inspect_events(
     assert written["mode"] == "relay"
     assert written["events"][0]["model"] == "anthropic/claude-test"
     assert written["events"][0]["metadata"] == {"host_key": "[REDACTED]"}
+
+
+async def test_json_outcome_sink_serializes_only_the_five_receipt_scalars(
+    tmp_path: Path,
+) -> None:
+    sink = JsonOutcomeSink(
+        TrialIdentity(name="trial-1", directory=tmp_path), protected=lambda: ()
+    )
+    outcome = dataclasses.replace(
+        _outcome(mode="relay", runner_atif=None, sha256=None),
+        terminal_receipts=(
+            RecordedByteCapReceipt(
+                phase="agent", time=123.5, recorded_bytes=2048, cap=1024
+            ),
+            RecordedByteCapReceipt(
+                phase="verifier", time=124.5, recorded_bytes=3072, cap=1024
+            ),
+        ),
+    )
+
+    await sink.close(outcome)
+
+    written = json.loads(
+        (tmp_path / "sandbox-agent-proxy" / "outcome.json").read_text(encoding="utf-8")
+    )
+    assert written["terminal_receipts"] == [
+        {
+            "kind": "relay_recorded_cap",
+            "phase": "agent",
+            "time": 123.5,
+            "recorded_bytes": 2048,
+            "cap": 1024,
+        },
+        {
+            "kind": "relay_recorded_cap",
+            "phase": "verifier",
+            "time": 124.5,
+            "recorded_bytes": 3072,
+            "cap": 1024,
+        },
+    ]
