@@ -992,8 +992,8 @@ async def test_usage_mode_keeps_no_refused_tool_call_arguments(tmp_path: Path) -
     assert lines[0]["refused"] in trial_relay.USAGE_REFUSAL_CODES
 
 
-# The usage.jsonl schema; the task harness's recorder
-# (HSAP_RECORD=usage) pins the same two key sets and refusal codes.
+# The usage.jsonl schema; the task harness's recorder (HSAP_RECORD=usage) pins the same
+# two key sets and refusal codes.
 _MODEL_ROW_KEYS = {
     "call_id",
     "call_id_source",
